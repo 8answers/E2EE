@@ -306,6 +306,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
   // Timer for debouncing data changed callbacks to prevent focus loss
   Timer? _dataChangedDebounceTimer;
   StreamSubscription<html.Event>? _visibilityChangeSubscription;
+  StreamSubscription<html.Event>? _onlineSubscription;
   // Flag to prevent saving during data loading
   bool _isLoadingData = false;
   bool _isAreaDataLoading = false;
@@ -313,6 +314,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
   bool _isSavingToSupabase = false;
   bool _pendingSaveToSupabase = false;
   bool _lastSaveSucceeded = true;
+  bool _hasUnsavedChanges = false;
   bool _appliedPendingCompensationDraft = false;
   bool _pendingPlotPartnerCleanupSave = false;
   bool _pendingLocalLayoutsResave = false;
@@ -339,8 +341,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
 
   // Area unit dropdown state
   String _selectedAreaUnit = 'Square Feet (sqft)';
+  String _baseAreaUnit = 'Square Feet (sqft)';
 
   bool get _isSqm => AreaUnitUtils.isSqm(_selectedAreaUnit);
+  bool get _baseIsSqm => AreaUnitUtils.isSqm(_baseAreaUnit);
   String get _areaUnitSuffix => AreaUnitUtils.unitSuffix(_isSqm);
 
   // Partners data
@@ -432,6 +436,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       {}; // Focus nodes for plot areas
   final Map<String, TextEditingController> _plotPurchaseRateControllers =
       {}; // Key: 'layoutIndex_plotIndex'
+  final Map<String, double> _plotAreaSqftCache =
+      {}; // Canonical area cache in sqft by plot key
   final Map<String, FocusNode> _plotPurchaseRateFocusNodes =
       {}; // Focus nodes for purchase rates
   final Map<String, List<String>> _plotPartners =
@@ -972,7 +978,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
   }
 
   double get _allocatedArea {
-    // Sum of all plot areas across all layouts
+    // Sum of all plot areas across all layouts (canonical sqft)
     double total = 0.0;
     for (int layoutIndex = 0; layoutIndex < _layouts.length; layoutIndex++) {
       final plotsData = _layouts[layoutIndex]['plots'];
@@ -995,11 +1001,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         final key = '${layoutIndex}_$plotIndex';
         final areaController = _plotAreaControllers[key];
         if (areaController != null) {
-          final area = double.tryParse(areaController.text
-                  .replaceAll(',', '')
-                  .replaceAll(' ', '')) ??
-              0.0;
-          total += area;
+          total += _plotAreaSqftForKey(key, areaController);
         }
       }
     }
@@ -1010,11 +1012,117 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     return _approvedSellingArea - _allocatedArea;
   }
 
+  double get _allInCostPerSqft {
+    return _approvedSellingArea > 0
+        ? _totalExpenses / _approvedSellingArea
+        : 0.0;
+  }
+
+  double get _allInCostPerDisplayUnit {
+    return AreaUnitUtils.rateFromSqftToDisplay(_allInCostPerSqft, _isSqm);
+  }
+
+  double get _allInCostPerDisplayUnitRounded {
+    return _roundToDecimals(_allInCostPerDisplayUnit, 2);
+  }
+
+  double get _allInCostPerBaseUnit {
+    return AreaUnitUtils.rateFromSqftToDisplay(_allInCostPerSqft, _baseIsSqm);
+  }
+
+  double get _allInCostPerBaseUnitRounded {
+    return _roundToDecimals(_allInCostPerBaseUnit, 2);
+  }
+
+  double _areaDisplayTextToSqft(String rawText, bool isSqmUnit) {
+    final display = double.tryParse(
+            rawText.replaceAll(',', '').replaceAll(' ', '').trim()) ??
+        0.0;
+    return AreaUnitUtils.areaFromDisplayToSqft(display, isSqmUnit);
+  }
+
+  double _plotAreaSqftForKey(String key, [TextEditingController? controller]) {
+    final cached = _plotAreaSqftCache[key];
+    if (cached != null) return cached;
+    final source = controller?.text ?? _plotAreaControllers[key]?.text ?? '';
+    final sqft = _areaDisplayTextToSqft(source, _isSqm);
+    _plotAreaSqftCache[key] = sqft;
+    return sqft;
+  }
+
+  void _updatePlotAreaSqftCacheFromText(String key, String text) {
+    _plotAreaSqftCache[key] = _areaDisplayTextToSqft(text, _isSqm);
+  }
+
+  double _parseDisplayNumber(String rawText) {
+    return double.tryParse(
+            rawText.replaceAll(',', '').replaceAll(' ', '').trim()) ??
+        0.0;
+  }
+
+  double _roundToDecimals(double value, int decimals) {
+    return double.tryParse(value.toStringAsFixed(decimals)) ?? value;
+  }
+
+  double _plotAreaDisplayRoundedForKey(String key,
+      [TextEditingController? controller]) {
+    final source = controller?.text ?? _plotAreaControllers[key]?.text ?? '';
+    return _roundToDecimals(_parseDisplayNumber(source), 3);
+  }
+
+  double _plotTotalCostFromRoundedFigures(String key,
+      [TextEditingController? controller]) {
+    final roundedArea = _plotAreaDisplayRoundedForKey(key, controller);
+    final roundedAllIn = _allInCostPerDisplayUnitRounded;
+    return _truncateToDecimals(roundedArea * roundedAllIn, 2);
+  }
+
+  double _plotTotalCostFromBaseRoundedFigures(String key,
+      [TextEditingController? controller]) {
+    final areaSqft = _plotAreaSqftForKey(key, controller);
+    final baseArea = AreaUnitUtils.areaFromSqftToDisplay(areaSqft, _baseIsSqm);
+    final roundedBaseArea = _roundToDecimals(baseArea, 3);
+    final roundedBaseAllIn = _allInCostPerBaseUnitRounded;
+    return _truncateToDecimals(roundedBaseArea * roundedBaseAllIn, 2);
+  }
+
+  double _projectTotalPlotCostFromBaseRoundedFigures() {
+    double total = 0.0;
+    for (int layoutIndex = 0; layoutIndex < _layouts.length; layoutIndex++) {
+      final plotsData = _layouts[layoutIndex]['plots'];
+      final plots = plotsData is List ? plotsData : const [];
+      for (int plotIndex = 0; plotIndex < plots.length; plotIndex++) {
+        final key = '${layoutIndex}_$plotIndex';
+        final areaController = _plotAreaControllers[key];
+        if (areaController != null) {
+          total += _plotTotalCostFromBaseRoundedFigures(key, areaController);
+        }
+      }
+    }
+    return total;
+  }
+
+  double _plotTotalCostFromCurrentRoundedFigures(String key,
+      [TextEditingController? controller]) {
+    return _plotTotalCostFromRoundedFigures(key, controller);
+  }
+
+  // Keep money at fixed decimals without rounding up (truncate only).
+  double _truncateToDecimals(double value, int decimals) {
+    if (decimals < 0) return value;
+    double factor = 1.0;
+    for (int i = 0; i < decimals; i++) {
+      factor *= 10.0;
+    }
+    return value >= 0
+        ? (value * factor).floorToDouble() / factor
+        : (value * factor).ceilToDouble() / factor;
+  }
+
   double get _totalPurchaseRate {
     // Calculate as sum of all-in cost values from the fourth column in the plots table
     // This is the sum of actual all-in cost values shown for each plot
-    final allInCost =
-        _approvedSellingArea > 0 ? _totalExpenses / _approvedSellingArea : 0.0;
+    final allInCost = _allInCostPerDisplayUnit;
 
     double total = 0.0;
     for (int layoutIndex = 0; layoutIndex < _layouts.length; layoutIndex++) {
@@ -1038,12 +1146,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         final key = '${layoutIndex}_$plotIndex';
         final areaController = _plotAreaControllers[key];
         if (areaController != null) {
-          final area = double.tryParse(areaController.text
-                      .replaceAll(',', '')
-                      .replaceAll(' ', '')
-                      .trim() ??
-                  '0') ??
-              0.0;
+          final area = _plotAreaSqftForKey(key, areaController);
           // Only sum for plots with area > 0
           if (area > 0) {
             // Add the all-in cost for this plot (same rate for all plots)
@@ -1058,45 +1161,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
   }
 
   double get _totalPlotCost {
-    // Calculate as sum of (area * all-in cost) for all plots
-    // All-in cost = total expenses / approved selling area
-    final allInCost =
-        _approvedSellingArea > 0 ? _totalExpenses / _approvedSellingArea : 0.0;
-
-    double total = 0.0;
-    for (int layoutIndex = 0; layoutIndex < _layouts.length; layoutIndex++) {
-      final plotsData = _layouts[layoutIndex]['plots'];
-      List<Map<String, dynamic>> plots;
-      if (plotsData is List) {
-        plots = plotsData.map((p) {
-          if (p is Map<String, dynamic>) {
-            return p;
-          } else if (p is Map) {
-            return Map<String, dynamic>.from(p);
-          } else {
-            return <String, dynamic>{};
-          }
-        }).toList();
-      } else {
-        plots = [];
-      }
-
-      for (int plotIndex = 0; plotIndex < plots.length; plotIndex++) {
-        final key = '${layoutIndex}_$plotIndex';
-        final areaController = _plotAreaControllers[key];
-        if (areaController != null) {
-          final area = double.tryParse(areaController.text
-                      .replaceAll(',', '')
-                      .replaceAll(' ', '')
-                      .trim() ??
-                  '0') ??
-              0.0;
-          // Total Plot Cost for this plot = area * all-in cost
-          total += area * allInCost;
-        }
-      }
-    }
-    return total;
+    // Always fixed to project base unit (not current display toggle).
+    return _projectTotalPlotCostFromBaseRoundedFigures();
   }
 
   bool get _hasPartnerValidationErrors {
@@ -1481,6 +1547,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     final newPlotNumberControllers = <String, TextEditingController>{};
     final newPlotAreaControllers = <String, TextEditingController>{};
     final newPlotPurchaseRateControllers = <String, TextEditingController>{};
+    final newPlotAreaSqftCache = <String, double>{};
 
     for (int i = _layouts.length; i < _layouts.length + numLayouts; i++) {
       // Create default plot for new layout
@@ -1502,6 +1569,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       final plotKey = '${i}_0';
       newPlotNumberControllers[plotKey] = TextEditingController();
       newPlotAreaControllers[plotKey] = TextEditingController();
+      newPlotAreaSqftCache[plotKey] = 0.0;
       newPlotPurchaseRateControllers[plotKey] = TextEditingController();
     }
 
@@ -1514,6 +1582,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       _layoutNameFocusNodes.addAll(newLayoutNameFocusNodes);
       _plotNumberControllers.addAll(newPlotNumberControllers);
       _plotAreaControllers.addAll(newPlotAreaControllers);
+      _plotAreaSqftCache.addAll(newPlotAreaSqftCache);
       _plotPurchaseRateControllers.addAll(newPlotPurchaseRateControllers);
 
       // Clear the input field and disable the button
@@ -1641,7 +1710,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       });
     } else {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
-        _selectedAreaUnit = await AreaUnitService.getAreaUnit(widget.projectId);
+        final persistedUnit =
+            await AreaUnitService.getAreaUnit(widget.projectId);
+        _baseAreaUnit = persistedUnit;
+        _selectedAreaUnit = persistedUnit;
         if (mounted) setState(() {});
       });
     }
@@ -1655,6 +1727,9 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       if (html.document.visibilityState == 'hidden') {
         _flushPendingSaveForNavigation();
       }
+    });
+    _onlineSubscription = html.window.onOnline.listen((_) {
+      _retrySaveOnReconnect();
     });
     // Notify initial error state
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1694,7 +1769,9 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
 
     try {
       // Load area unit preference
-      _selectedAreaUnit = await AreaUnitService.getAreaUnit(widget.projectId);
+      final persistedUnit = await AreaUnitService.getAreaUnit(widget.projectId);
+      _baseAreaUnit = persistedUnit;
+      _selectedAreaUnit = persistedUnit;
 
       // Load project basic info
       final project = await _supabase
@@ -1770,7 +1847,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                 areaSqft, AreaUnitUtils.isSqm(_selectedAreaUnit));
             return <String, String>{
               'name': (area['name'] ?? '').toString(),
-              'area': areaSqft == 0.0 ? '' : _formatDecimal(areaDisplay),
+              'area': areaSqft == 0.0 ? '' : _formatAreaDecimal(areaDisplay),
             };
           }).toList();
         } else {
@@ -1826,7 +1903,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
               .map((partner) => {
                     'id': partner['id'],
                     'name': partner['name'] ?? '',
-                    'amount': _formatDecimal(partner['amount'] ?? 0.0),
+                    'amount': _formatMoneyDecimal(partner['amount'] ?? 0.0),
                   })
               .toList();
         } else {
@@ -1880,7 +1957,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
               .map((expense) => {
                     'id': expense['id'],
                     'item': expense['item'] ?? '',
-                    'amount': _formatDecimal(expense['amount'] ?? 0.0),
+                    'amount': _formatMoneyDecimal(expense['amount'] ?? 0.0),
                     // Map database category back to UI label
                     'category': _mapExpenseCategoryFromDatabase(
                         expense['category'] ?? ''),
@@ -1958,13 +2035,14 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
             plotsData.add({
               'id': (plot['id'] ?? '').toString(),
               'plotNumber': (plot['plot_number'] ?? '').toString(),
-              'area': _formatDecimal(plot['area'] ?? 0.0),
+              'area': _formatAreaDecimal(plot['area'] ?? 0.0),
               'purchaseRate':
-                  _formatDecimal(plot['all_in_cost_per_sqft'] ?? 0.0),
-              'totalPlotCost': _formatDecimal(plot['total_plot_cost'] ?? 0.0),
+                  _formatMoneyDecimal(plot['all_in_cost_per_sqft'] ?? 0.0),
+              'totalPlotCost':
+                  _formatMoneyDecimal(plot['total_plot_cost'] ?? 0.0),
               'status': (plot['status'] ?? 'available').toString(),
               'salePrice': plot['sale_price'] != null
-                  ? _formatDecimal(plot['sale_price'])
+                  ? _formatMoneyDecimal(plot['sale_price'])
                   : null,
               'buyerName': (plot['buyer_name'] ?? '').toString(),
               'saleDate': _formatDateFromDatabase(plot['sale_date']),
@@ -1999,6 +2077,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       _layoutNameControllers.clear();
       _plotNumberControllers.clear();
       _plotAreaControllers.clear();
+      _plotAreaSqftCache.clear();
       _plotPurchaseRateControllers.clear();
       _plotPartners.clear();
       _lastNonEmptyPlotPartners.clear();
@@ -2067,6 +2146,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                 0.0;
             final plotAreaDisplay =
                 AreaUnitUtils.areaFromSqftToDisplay(plotAreaSqft, _isSqm);
+            _plotAreaSqftCache[key] = plotAreaSqft;
             _plotAreaControllers[key] = TextEditingController(
                 text: plotAreaSqft == 0.0
                     ? ''
@@ -2676,7 +2756,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     await prefs.setBool('project_${projectId}_hide_default_non_sellable', hide);
   }
 
-  String _formatDecimal(dynamic value) {
+  String _formatAreaDecimal(dynamic value) {
     if (value == null) return '0';
 
     double numValue;
@@ -2688,7 +2768,21 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       return '0';
     }
 
-    // Use smart formatting helper
+    return _formatAmountDisplay(numValue, decimalPlaces: 3);
+  }
+
+  String _formatMoneyDecimal(dynamic value) {
+    if (value == null) return '0';
+
+    double numValue;
+    if (value is String) {
+      numValue = double.tryParse(value) ?? 0.0;
+    } else if (value is num) {
+      numValue = value.toDouble();
+    } else {
+      return '0';
+    }
+
     return _formatAmountDisplay(numValue, decimalPlaces: 2);
   }
 
@@ -3597,6 +3691,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     _layoutNameControllers.clear();
     _plotNumberControllers.clear();
     _plotAreaControllers.clear();
+    _plotAreaSqftCache.clear();
     _plotPurchaseRateControllers.clear();
     _plotPartners.clear();
     _lastNonEmptyPlotPartners.clear();
@@ -3629,6 +3724,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
               text: (plot['plotNumber'] ?? '').toString());
           _plotAreaControllers[key] =
               TextEditingController(text: (plot['area'] ?? '').toString());
+          _updatePlotAreaSqftCacheFromText(
+              key, _plotAreaControllers[key]!.text);
           _plotPurchaseRateControllers[key] = TextEditingController(
               text: (plot['purchaseRate'] ?? '').toString());
           _plotPartners[key] = List<String>.from(
@@ -3793,6 +3890,11 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       return;
     }
 
+    if (!_hasUnsavedChanges) {
+      _hasUnsavedChanges = true;
+      widget.onSaveStatusChanged?.call(ProjectSaveStatusType.notSaved);
+    }
+
     // Save to local storage immediately (for better data persistence)
     _saveLayoutsData();
     _saveAgentsData();
@@ -3814,11 +3916,13 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saving);
       if (widget.projectId != null && widget.projectId!.isNotEmpty) {
         _saveToSupabase();
+      } else {
+        _saveStatusTimer?.cancel();
+        _saveStatusTimer = Timer(const Duration(seconds: 1), () {
+          _hasUnsavedChanges = false;
+          widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saved);
+        });
       }
-      _saveStatusTimer?.cancel();
-      _saveStatusTimer = Timer(const Duration(seconds: 1), () {
-        widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saved);
-      });
       return;
     }
 
@@ -3839,15 +3943,16 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       // most recent row/edit is not lost on refresh/navigation.
       if (widget.projectId != null && widget.projectId!.isNotEmpty) {
         _saveToSupabase();
+      } else {
+        // Cancel existing timer
+        _saveStatusTimer?.cancel();
+
+        // Local-only mode: mark saved after a short quiet period.
+        _saveStatusTimer = Timer(const Duration(seconds: 1), () {
+          _hasUnsavedChanges = false;
+          widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saved);
+        });
       }
-
-      // Cancel existing timer
-      _saveStatusTimer?.cancel();
-
-      // Set timer to change to saved after 1 second of no changes (reduced for faster feedback)
-      _saveStatusTimer = Timer(const Duration(seconds: 1), () {
-        widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saved);
-      });
     });
   }
 
@@ -3863,6 +3968,16 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         _hasSuccessfullyLoadedFromSupabase) {
       _saveToSupabase();
     }
+  }
+
+  void _retrySaveOnReconnect() {
+    if (!_hasUnsavedChanges) return;
+    if (_isLoadingData) return;
+    if (widget.projectId == null || widget.projectId!.isEmpty) return;
+    if (!_hasSuccessfullyLoadedFromSupabase) return;
+
+    widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saving);
+    _saveToSupabase();
   }
 
   Future<void> _saveImmediatelyAndWait() async {
@@ -4050,11 +4165,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                 List<String>.from(plotPartners);
           }
 
-          // Calculate All-in Cost (same for all plots) = Total Expenses / Approved Selling Area
-          // This is what should be saved as all_in_cost_per_sqft
-          final allInCost = _approvedSellingArea > 0
-              ? _totalExpenses / _approvedSellingArea
-              : 0.0;
+          // Canonical all-in cost (₹/sqft) for persistence.
+          final allInCostPerSqft = _allInCostPerSqft;
 
           // Calculate Total Plot Cost = Area (sqft) * All-in Cost. Convert display area to sqft.
           final areaDisplay = double.tryParse(plotAreaController?.text
@@ -4063,14 +4175,16 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                       .trim() ??
                   '0') ??
               0.0;
-          final areaSqft =
+          final areaSqft = _plotAreaSqftCache[key] ??
               AreaUnitUtils.areaFromDisplayToSqft(areaDisplay, _isSqm);
-          final totalPlotCost = areaSqft * allInCost;
+          _plotAreaSqftCache[key] = areaSqft;
+          final totalPlotCostTruncated =
+              _plotTotalCostFromBaseRoundedFigures(key, plotAreaController);
 
           // Debug logging for first plot only
           if (plotIndex == 0 && layoutIndex == 0) {
             print(
-                'All-in Cost calculation: _totalExpenses=$_totalExpenses, _approvedSellingArea=$_approvedSellingArea, allInCost=$allInCost');
+                'All-in Cost calculation: _totalExpenses=$_totalExpenses, _approvedSellingArea=$_approvedSellingArea, allInCostPerSqft=$allInCostPerSqft');
           }
 
           print(
@@ -4079,10 +4193,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
           final plotSaveData = <String, dynamic>{
             'id': plotId,
             'plotNumber': plotNumber,
-            'area': _formatDecimal(areaSqft),
-            'purchaseRate':
-                allInCost.toStringAsFixed(2), // Save calculated all-in cost
-            'totalPlotCost': totalPlotCost
+            'area': _formatAreaDecimal(areaSqft),
+            'purchaseRate': allInCostPerSqft
+                .toStringAsFixed(2), // Save calculated all-in cost
+            'totalPlotCost': totalPlotCostTruncated
                 .toStringAsFixed(2), // Save calculated total plot cost
             'status': plots[plotIndex]['status']?.toString() ?? 'available',
             'salePrice': plots[plotIndex]['salePrice']?.toString(),
@@ -4245,7 +4359,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
             'Non-sellable area $i: name="$name", area display=$areaDisplay -> sqft=$areaSqft');
         if (name.isNotEmpty) {
           nonSellableAreasData
-              .add({'name': name, 'area': _formatDecimal(areaSqft)});
+              .add({'name': name, 'area': _formatAreaDecimal(areaSqft)});
         }
       }
       print('Prepared ${nonSellableAreasData.length} non-sellable areas');
@@ -4445,9 +4559,9 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       final sellingAreaSqft =
           AreaUnitUtils.areaFromDisplayToSqft(sellingAreaDisplay, _isSqm);
       final totalAreaText =
-          totalAreaDisplay == 0 ? '' : _formatDecimal(totalAreaSqft);
+          totalAreaDisplay == 0 ? '' : _formatAreaDecimal(totalAreaSqft);
       final sellingAreaText =
-          sellingAreaDisplay == 0 ? '' : _formatDecimal(sellingAreaSqft);
+          sellingAreaDisplay == 0 ? '' : _formatAreaDecimal(sellingAreaSqft);
       final estimatedCostText = _estimatedDevelopmentCostController.text
           .replaceAll(',', '')
           .replaceAll(' ', '')
@@ -4477,6 +4591,9 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         agents: finalAgentsData,
       );
       _lastSaveSucceeded = true;
+      _hasUnsavedChanges = false;
+      _saveStatusTimer?.cancel();
+      widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saved);
       await _markSuccessfulRemoteSaveTimestamp();
       print('Successfully saved project data to Supabase');
       // Clear dirty partner keys after successful save
@@ -4484,6 +4601,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       _partnersDirty = false;
     } catch (e, stackTrace) {
       _lastSaveSucceeded = false;
+      _saveStatusTimer?.cancel();
+      widget.onSaveStatusChanged?.call(ProjectSaveStatusType.connectionLost);
       print('Error saving to Supabase: $e');
       print('Stack trace: $stackTrace');
       // Don't show error to user, just log it
@@ -4541,6 +4660,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     _saveStatusTimer?.cancel();
     _dataChangedDebounceTimer?.cancel();
     _visibilityChangeSubscription?.cancel();
+    _onlineSubscription?.cancel();
     _projectNameController.dispose();
     _projectAddressController.dispose();
     _googleMapsLinkController.dispose();
@@ -4628,6 +4748,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       controller.dispose();
     }
     _plotAreaControllers.clear();
+    _plotAreaSqftCache.clear();
     for (var focusNode in _plotAreaFocusNodes.values) {
       focusNode.dispose();
     }
@@ -5723,6 +5844,17 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     double toSqft(double v) => oldIsSqm ? v * AreaUnitUtils.sqmToSqft : v;
     double fromSqft(double sqft) =>
         newIsSqm ? sqft * AreaUnitUtils.sqftToSqm : sqft;
+    double normalizeConvertedArea(double v) {
+      // Avoid visible round-trip drift like 1200 -> sqm -> 1200.003
+      // when switching units using rounded display values.
+      final rounded3 = double.parse(v.toStringAsFixed(3));
+      final nearestInteger = rounded3.roundToDouble();
+      if ((rounded3 - nearestInteger).abs() <= 0.005) {
+        return nearestInteger;
+      }
+      return rounded3;
+    }
+
     double rateToSqft(double v) => oldIsSqm ? v / AreaUnitUtils.sqmToSqft : v;
     double rateFromSqft(double perSqft) =>
         newIsSqm ? perSqft * AreaUnitUtils.sqmToSqft : perSqft;
@@ -5733,7 +5865,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         0;
     _totalAreaController.text = totalDisplay == 0
         ? ''
-        : _formatInputAmount(fromSqft(toSqft(totalDisplay)), decimalPlaces: 3);
+        : _formatInputAmount(
+            normalizeConvertedArea(fromSqft(toSqft(totalDisplay))),
+            decimalPlaces: 3,
+          );
 
     final sellingDisplay = double.tryParse(_sellingAreaController.text
             .replaceAll(',', '')
@@ -5741,8 +5876,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         0;
     _sellingAreaController.text = sellingDisplay == 0
         ? ''
-        : _formatInputAmount(fromSqft(toSqft(sellingDisplay)),
-            decimalPlaces: 3);
+        : _formatInputAmount(
+            normalizeConvertedArea(fromSqft(toSqft(sellingDisplay))),
+            decimalPlaces: 3,
+          );
 
     for (int i = 0; i < _nonSellableAreaControllers.length; i++) {
       final c = _nonSellableAreaControllers[i];
@@ -5752,7 +5889,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                 0;
         c.text = v == 0
             ? ''
-            : _formatInputAmount(fromSqft(toSqft(v)), decimalPlaces: 3);
+            : _formatInputAmount(
+                normalizeConvertedArea(fromSqft(toSqft(v))),
+                decimalPlaces: 3,
+              );
       }
     }
     for (int i = 0; i < _nonSellableAreas.length; i++) {
@@ -5760,16 +5900,25 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
               _nonSellableAreas[i]['area']?.toString().replaceAll(',', '') ??
                   '0') ??
           0;
-      _nonSellableAreas[i]['area'] =
-          a == 0 ? '' : _formatDecimal(fromSqft(toSqft(a)));
+      _nonSellableAreas[i]['area'] = a == 0
+          ? ''
+          : _formatAreaDecimal(
+              normalizeConvertedArea(fromSqft(toSqft(a))),
+            );
     }
     for (final entry in _plotAreaControllers.entries) {
-      final v = double.tryParse(
-              entry.value.text.replaceAll(',', '').replaceAll(' ', '')) ??
-          0;
-      if (v > 0) {
-        entry.value.text =
-            _formatInputAmount(fromSqft(toSqft(v)), decimalPlaces: 3);
+      final key = entry.key;
+      final cachedSqft = _plotAreaSqftCache[key];
+      final areaSqft =
+          cachedSqft ?? _areaDisplayTextToSqft(entry.value.text, oldIsSqm);
+      _plotAreaSqftCache[key] = areaSqft;
+      if (areaSqft > 0) {
+        entry.value.text = _formatInputAmount(
+          normalizeConvertedArea(fromSqft(areaSqft)),
+          decimalPlaces: 3,
+        );
+      } else {
+        entry.value.text = '';
       }
     }
     // Convert agent per sqft/sqm fee (rates)
@@ -10742,7 +10891,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                     ),
                                     TextSpan(
                                       text:
-                                          '₹ ${_formatAmountForDisplay(_approvedSellingArea > 0 ? _totalExpenses / _approvedSellingArea : 0, decimalPlaces: 3)}',
+                                          '₹ ${_formatAmountForDisplay(_allInCostPerDisplayUnit, decimalPlaces: 2)} /$_areaUnitSuffix',
                                       style: GoogleFonts.inter(
                                         fontSize: 14,
                                         fontWeight: FontWeight.w400,
@@ -10770,7 +10919,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                     ),
                                     TextSpan(
                                       text:
-                                          '₹ ${_formatAmountForDisplay(_totalPlotCost, decimalPlaces: 3)}',
+                                          '₹ ${_formatAmountForDisplay(_truncateToDecimals(_totalPlotCost, 2), decimalPlaces: 2)}',
                                       style: GoogleFonts.inter(
                                         fontSize: 14,
                                         fontWeight: FontWeight.w400,
@@ -16642,25 +16791,26 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     double totalArea = 0.0;
     double totalAllInCost = 0.0;
     double totalPlotCost = 0.0;
-    // Calculate All-in Cost as Total Expenses / Approved selling area
-    final allInCost =
-        _approvedSellingArea > 0 ? _totalExpenses / _approvedSellingArea : 0.0;
+    // Display-unit rate for the All-in Cost column.
+    final allInCost = _allInCostPerDisplayUnit;
 
     int plotCount = 0;
     for (int i = 0; i < plots.length; i++) {
       final areaKey = '${layoutIndex}_$i';
       final areaController = _plotAreaControllers[areaKey];
       if (areaController != null) {
-        final area = double.tryParse(
+        final areaDisplay = double.tryParse(
                 areaController.text.replaceAll(',', '').replaceAll(' ', '')) ??
             0.0;
-        totalArea += area;
+        final areaSqft = _plotAreaSqftForKey(areaKey, areaController);
+        totalArea += areaDisplay;
         // Only count plots with area > 0
-        if (area > 0) {
+        if (areaSqft > 0) {
           plotCount++;
         }
-        // Total Plot Cost for this plot = area * all-in cost
-        totalPlotCost += area * allInCost;
+        // Total Plot Cost uses rounded Area (3dp) * rounded All-in Cost (2dp).
+        totalPlotCost +=
+            _plotTotalCostFromBaseRoundedFigures(areaKey, areaController);
       }
     }
 
@@ -16852,7 +17002,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                     ),
                   ),
                   Text(
-                    '₹ ${_formatAmountForDisplay(totalPlotCost, decimalPlaces: 3)}',
+                    '₹ ${_formatAmountForDisplay(_truncateToDecimals(totalPlotCost, 2), decimalPlaces: 2)}',
                     style: GoogleFonts.inter(
                       fontSize: 14,
                       fontWeight: FontWeight.normal,
@@ -17132,6 +17282,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                           final key = '${layoutIndex}_$newPlotIndex';
                           _plotNumberControllers[key] = TextEditingController();
                           _plotAreaControllers[key] = TextEditingController();
+                          _plotAreaSqftCache[key] = 0.0;
                           _plotPurchaseRateControllers[key] =
                               TextEditingController();
                           _plotPartners[key] = <String>[];
@@ -17299,6 +17450,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       if (_plotAreaControllers[plotKey] == null) {
         _plotAreaControllers[plotKey] = TextEditingController();
       }
+      _plotAreaSqftCache.putIfAbsent(plotKey, () => 0.0);
       if (_plotPurchaseRateControllers[plotKey] == null) {
         _plotPurchaseRateControllers[plotKey] = TextEditingController();
       }
@@ -17683,6 +17835,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                           plots[index]['area'] = cleaned.isEmpty
                                               ? '0.00'
                                               : cleaned;
+                                          _updatePlotAreaSqftCacheFromText(
+                                              key, value);
                                           setState(
                                               () {}); // Recalculate totals and update shadow
                                           _onDataChanged();
@@ -17699,6 +17853,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                           controller.text = formatted;
                                           plots[index]['area'] =
                                               formatted.replaceAll(',', '');
+                                          _updatePlotAreaSqftCacheFromText(
+                                              key, formatted);
                                           focusNode.unfocus();
                                           setState(() {});
                                           _onDataChanged(immediate: true);
@@ -17715,6 +17871,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                           controller.text = formatted;
                                           plots[index]['area'] =
                                               formatted.replaceAll(',', '');
+                                          _updatePlotAreaSqftCacheFromText(
+                                              key, formatted);
                                           focusNode.unfocus();
                                           setState(() {});
                                           _onDataChanged(immediate: true);
@@ -17772,10 +17930,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                     selectedPartners.isEmpty || selectedPartners.length == 1
                         ? 48.0
                         : 48.0 + (selectedPartners.length - 1) * 36.0;
-                // Calculate All-in Cost as Total Expenses / Approved selling area
-                final allInCost = _approvedSellingArea > 0
-                    ? _totalExpenses / _approvedSellingArea
-                    : 0.0;
+                // All-in Cost in currently selected/display unit (₹/sqft or ₹/sqm)
+                final allInCost = _allInCostPerDisplayUnit;
                 final isEmpty = allInCost == 0.0;
                 return Container(
                   width: 215,
@@ -17813,7 +17969,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                 text: isEmpty
                                     ? '0.00'
                                     : _formatAmountForDisplay(allInCost,
-                                        decimalPlaces: 5),
+                                        decimalPlaces: 2),
                                 style: GoogleFonts.inter(
                                   fontSize: 14,
                                   fontWeight: FontWeight.normal,
@@ -17870,20 +18026,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
 
                 // Get Area (column 3) and All-in Cost (column 4) to calculate Total Plot Cost
                 final areaController = _plotAreaControllers[key];
-                final area = double.tryParse(areaController?.text
-                            .replaceAll(',', '')
-                            .replaceAll(' ', '')
-                            .trim() ??
-                        '0') ??
-                    0.0;
-
-                // Calculate All-in Cost as Total Expenses / Approved selling area
-                final allInCost = _approvedSellingArea > 0
-                    ? _totalExpenses / _approvedSellingArea
-                    : 0.0;
-
-                // Total Plot Cost = Area * All-in Cost
-                final totalPlotCost = area * allInCost;
+                final totalPlotCost =
+                    _plotTotalCostFromBaseRoundedFigures(key, areaController);
 
                 return Container(
                   width: 215,
@@ -17919,9 +18063,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                               const TextSpan(text: '₹ '),
                               TextSpan(
                                 text: totalPlotCost == 0.0
-                                    ? '0.000'
-                                    : _formatAmountForDisplay(totalPlotCost,
-                                        decimalPlaces: 3),
+                                    ? '0.00'
+                                    : _formatAmountForDisplay(
+                                        _truncateToDecimals(totalPlotCost, 2),
+                                        decimalPlaces: 2),
                                 style: GoogleFonts.inter(
                                   fontSize: 14,
                                   fontWeight: FontWeight.normal,
@@ -18179,6 +18324,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                         _plotPurchaseRateControllers[key]?.dispose();
                         _plotNumberControllers.remove(key);
                         _plotAreaControllers.remove(key);
+                        _plotAreaSqftCache.remove(key);
                         _plotPurchaseRateControllers.remove(key);
                         _plotPartners.remove(key);
                         _lastNonEmptyPlotPartners.remove(key);
@@ -18195,6 +18341,10 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                 _plotNumberControllers.remove(oldKey)!;
                             _plotAreaControllers[newKey] =
                                 _plotAreaControllers.remove(oldKey)!;
+                            if (_plotAreaSqftCache.containsKey(oldKey)) {
+                              _plotAreaSqftCache[newKey] =
+                                  _plotAreaSqftCache.remove(oldKey)!;
+                            }
                             _plotPurchaseRateControllers[newKey] =
                                 _plotPurchaseRateControllers.remove(oldKey)!;
                             _plotPartners[newKey] =

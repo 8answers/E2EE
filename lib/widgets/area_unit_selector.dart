@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:flutter_svg/flutter_svg.dart';
-import '../services/area_unit_service.dart';
 
 const List<String> _areaUnitOptions = [
   'Square Feet (sqft)',
@@ -122,8 +121,6 @@ class _AreaUnitSelectorState extends State<AreaUnitSelector> {
                       onTap: () async {
                         if (option != selectedUnit) {
                           widget.onUnitChanged(option);
-                          await AreaUnitService.setAreaUnit(
-                              widget.projectId, option);
                         }
                         _closeDropdown();
                       },
