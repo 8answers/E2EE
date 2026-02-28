@@ -10,10 +10,7 @@ class StartupWebsiteView extends StatefulWidget {
 }
 
 class _StartupWebsiteViewState extends State<StartupWebsiteView> {
-  // Serve landing page from Flutter web assets so production rewrites don't
-  // trap users on the Flutter loading spinner.
-  static const String _startupUrl =
-      '/assets/website_8answers%20copy%202/index.html';
+  static const String _startupUrl = '/website_8answers%20copy%202/index.html';
   bool _hasRedirected = false;
 
   @override
@@ -27,8 +24,8 @@ class _StartupWebsiteViewState extends State<StartupWebsiteView> {
     _hasRedirected = true;
 
     final currentPath = html.window.location.pathname ?? '';
-    if (currentPath.contains('/assets/website_8answers%20copy%202/') ||
-        currentPath.contains('/assets/website_8answers copy 2/')) {
+    if (currentPath.contains('/website_8answers%20copy%202/') ||
+        currentPath.contains('/website_8answers copy 2/')) {
       return;
     }
 
