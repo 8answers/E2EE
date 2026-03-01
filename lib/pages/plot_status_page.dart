@@ -580,6 +580,7 @@ class _PlotStatusPageState extends State<PlotStatusPage> {
     _areaUnit = await AreaUnitService.getAreaUnit(widget.projectId);
     List<Map<String, dynamic>> sourceLayouts = widget.layouts ?? [];
     List<Map<String, dynamic>> agents = [];
+    bool loadedFromEncryptedSnapshot = false;
 
     print(
         '🔵 _loadPlotData ENTRY: widget.layouts=${widget.layouts?.length ?? "null"}, widget.projectId=${widget.projectId}');
@@ -587,123 +588,209 @@ class _PlotStatusPageState extends State<PlotStatusPage> {
     // If projectId is available, load from database first
     if (widget.projectId != null && widget.projectId!.isNotEmpty) {
       try {
-        print(
-            'PlotStatusPage: Loading data from database for projectId=${widget.projectId}');
+        final projectData =
+            await ProjectStorageService.fetchProjectDataById(widget.projectId!);
+        if (projectData != null) {
+          final layouts = ((projectData['layouts'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((e) => e.cast<String, dynamic>())
+              .toList();
+          final allPlots = ((projectData['plots'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((e) => e.cast<String, dynamic>())
+              .toList();
+          final allPlotPartners =
+              ((projectData['plot_partners'] as List?) ?? const [])
+                  .whereType<Map>()
+                  .map((e) => e.cast<String, dynamic>())
+                  .toList();
 
-        // Load layouts from database
-        final layouts = await _supabase
-            .from('layouts')
-            .select('id, name')
-            .eq('project_id', widget.projectId!)
-            .order('created_at', ascending: true);
+          final plotsByLayoutId = <String, List<Map<String, dynamic>>>{};
+          for (final plot in allPlots) {
+            final layoutId = (plot['layout_id'] ?? '').toString();
+            if (layoutId.isEmpty) continue;
+            plotsByLayoutId.putIfAbsent(
+                layoutId, () => <Map<String, dynamic>>[]);
+            plotsByLayoutId[layoutId]!.add(plot);
+          }
+          final partnersByPlotId = <String, List<String>>{};
+          for (final row in allPlotPartners) {
+            final plotId = (row['plot_id'] ?? '').toString();
+            final partnerName = (row['partner_name'] ?? '').toString().trim();
+            if (plotId.isEmpty || partnerName.isEmpty) continue;
+            partnersByPlotId.putIfAbsent(plotId, () => <String>[]);
+            partnersByPlotId[plotId]!.add(partnerName);
+          }
 
-        print('📥 LOADED LAYOUTS FROM DB: ${layouts.length} layouts');
-        for (var i = 0; i < layouts.length; i++) {
-          print(
-              '   Layout $i: id=${layouts[i]['id']}, name=${layouts[i]['name']}');
-        }
-
-        final layoutsData = <Map<String, dynamic>>[];
-
-        if (layouts.isNotEmpty) {
-          for (var layout in layouts) {
-            final layoutId = layout['id'];
-            final plots = await _supabase
-                .from('plots')
-                .select()
-                .eq('layout_id', layoutId)
-                .order('created_at', ascending: true);
-
-            print('   📥 Layout ${layout['name']} has ${plots.length} plots');
-            for (var p = 0; p < plots.length; p++) {
-              print(
-                  '      Plot $p: plotNumber=${plots[p]['plot_number']}, status=${plots[p]['status']}');
-            }
-
-            final plotsData = <Map<String, dynamic>>[];
-            for (var plot in plots) {
-              // Load plot partners
-              final plotPartners = await _supabase
-                  .from('plot_partners')
-                  .select('partner_name')
-                  .eq('plot_id', plot['id']);
-
-              // Parse DB status string to PlotStatus enum
-              final plotStatus = _parsePlotStatus(plot['status']);
-
-              // Log what payments data is in the database for this plot
-              final paymentsFromDb = plot['payments'];
-              print(
-                  '📥 LOADING Plot ${plot['plot_number']}: payments from DB = ${paymentsFromDb.runtimeType} - $paymentsFromDb');
-
-              plotsData.add({
+          sourceLayouts = layouts.map((layout) {
+            final layoutId = (layout['id'] ?? '').toString();
+            final layoutPlots =
+                plotsByLayoutId[layoutId] ?? const <Map<String, dynamic>>[];
+            final plotsData = layoutPlots.map((plot) {
+              final plotId = (plot['id'] ?? '').toString();
+              return <String, dynamic>{
+                'id': plotId,
                 'plotNumber': (plot['plot_number'] ?? '').toString(),
                 'area': _formatWithFixedDecimals(plot['area'] ?? 0.0, 3),
                 'purchaseRate': _formatWithFixedDecimals(
                     plot['all_in_cost_per_sqft'] ?? 0.0, 2),
                 'totalPlotCost':
                     _formatWithFixedDecimals(plot['total_plot_cost'] ?? 0.0, 2),
-                'status': plotStatus,
+                'status': (plot['status'] ?? 'available').toString(),
                 'salePrice':
                     plot['sale_price'] != null && plot['sale_price'] != 0
                         ? _formatWithFixedDecimals(plot['sale_price'], 2)
                         : '',
                 'buyerName': (plot['buyer_name'] ?? '').toString(),
-                'buyerContactNumber': (plot['buyer_contact_number'] ??
-                        plot['buyer_mobile_number'] ??
-                        '')
-                    .toString(),
+                'buyerContactNumber':
+                    (plot['buyer_contact_number'] ?? '').toString(),
                 'saleDate': _formatDateFromDatabase(plot['sale_date']),
                 'agent': (plot['agent_name'] ?? '').toString(),
-                'partners': plotPartners
-                    .map((p) => (p['partner_name'] ?? '').toString())
-                    .toList(),
+                'partners': List<String>.from(
+                    partnersByPlotId[plotId] ?? const <String>[]),
                 'payments': (plot['payments'] as List<dynamic>?) ?? [],
-              });
-            }
+              };
+            }).toList();
 
-            layoutsData.add({
+            return <String, dynamic>{
               'name': (layout['name'] ?? '').toString(),
               'plots': plotsData,
-            });
-          }
-        }
+            };
+          }).toList();
 
-        print('📥 TOTAL LAYOUTS FROM DB TO ADD: ${layoutsData.length} layouts');
-        for (var i = 0; i < layoutsData.length; i++) {
-          final plots = layoutsData[i]['plots'] as List<dynamic>? ?? [];
+          agents = ((projectData['agents'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((row) => <String, dynamic>{
+                    'name': (row['name'] ?? '').toString(),
+                  })
+              .toList();
+          loadedFromEncryptedSnapshot = sourceLayouts.isNotEmpty;
           print(
-              '   Loaded Layout $i (${layoutsData[i]['name']}): ${plots.length} plots');
+              '✅ PlotStatusPage using encrypted snapshot layouts=${sourceLayouts.length}, agents=${agents.length}');
         }
-
-        // Only use database data if we have layouts with actual plots
-        // Otherwise fall back to local storage which may have more recent data
-        final hasAnyPlots = layoutsData.any((layout) =>
-            (layout['plots'] as List<dynamic>?)?.isNotEmpty ?? false);
-
-        if (hasAnyPlots) {
-          sourceLayouts = layoutsData;
-          print(
-              '✅ Using database layouts (has ${layoutsData.length} layouts with plots)');
+        if (loadedFromEncryptedSnapshot) {
+          // Skip legacy row-based loaders.
         } else {
-          print('⚠️ Database has layouts but no plots, will try local storage');
+          print(
+              'PlotStatusPage: Loading data from database for projectId=${widget.projectId}');
+
+          // Load layouts from database
+          final layouts = await _supabase
+              .from('layouts')
+              .select('id, name')
+              .eq('project_id', widget.projectId!)
+              .order('created_at', ascending: true);
+
+          print('📥 LOADED LAYOUTS FROM DB: ${layouts.length} layouts');
+          for (var i = 0; i < layouts.length; i++) {
+            print(
+                '   Layout $i: id=${layouts[i]['id']}, name=${layouts[i]['name']}');
+          }
+
+          final layoutsData = <Map<String, dynamic>>[];
+
+          if (layouts.isNotEmpty) {
+            for (var layout in layouts) {
+              final layoutId = layout['id'];
+              final plots = await _supabase
+                  .from('plots')
+                  .select()
+                  .eq('layout_id', layoutId)
+                  .order('created_at', ascending: true);
+
+              print('   📥 Layout ${layout['name']} has ${plots.length} plots');
+              for (var p = 0; p < plots.length; p++) {
+                print(
+                    '      Plot $p: plotNumber=${plots[p]['plot_number']}, status=${plots[p]['status']}');
+              }
+
+              final plotsData = <Map<String, dynamic>>[];
+              for (var plot in plots) {
+                // Load plot partners
+                final plotPartners = await _supabase
+                    .from('plot_partners')
+                    .select('partner_name')
+                    .eq('plot_id', plot['id']);
+
+                // Parse DB status string to PlotStatus enum
+                final plotStatus = _parsePlotStatus(plot['status']);
+
+                // Log what payments data is in the database for this plot
+                final paymentsFromDb = plot['payments'];
+                print(
+                    '📥 LOADING Plot ${plot['plot_number']}: payments from DB = ${paymentsFromDb.runtimeType} - $paymentsFromDb');
+
+                plotsData.add({
+                  'plotNumber': (plot['plot_number'] ?? '').toString(),
+                  'area': _formatWithFixedDecimals(plot['area'] ?? 0.0, 3),
+                  'purchaseRate': _formatWithFixedDecimals(
+                      plot['all_in_cost_per_sqft'] ?? 0.0, 2),
+                  'totalPlotCost': _formatWithFixedDecimals(
+                      plot['total_plot_cost'] ?? 0.0, 2),
+                  'status': plotStatus,
+                  'salePrice':
+                      plot['sale_price'] != null && plot['sale_price'] != 0
+                          ? _formatWithFixedDecimals(plot['sale_price'], 2)
+                          : '',
+                  'buyerName': (plot['buyer_name'] ?? '').toString(),
+                  'buyerContactNumber': (plot['buyer_contact_number'] ??
+                          plot['buyer_mobile_number'] ??
+                          '')
+                      .toString(),
+                  'saleDate': _formatDateFromDatabase(plot['sale_date']),
+                  'agent': (plot['agent_name'] ?? '').toString(),
+                  'partners': plotPartners
+                      .map((p) => (p['partner_name'] ?? '').toString())
+                      .toList(),
+                  'payments': (plot['payments'] as List<dynamic>?) ?? [],
+                });
+              }
+
+              layoutsData.add({
+                'name': (layout['name'] ?? '').toString(),
+                'plots': plotsData,
+              });
+            }
+          }
+
+          print(
+              '📥 TOTAL LAYOUTS FROM DB TO ADD: ${layoutsData.length} layouts');
+          for (var i = 0; i < layoutsData.length; i++) {
+            final plots = layoutsData[i]['plots'] as List<dynamic>? ?? [];
+            print(
+                '   Loaded Layout $i (${layoutsData[i]['name']}): ${plots.length} plots');
+          }
+
+          // Only use database data if we have layouts with actual plots
+          // Otherwise fall back to local storage which may have more recent data
+          final hasAnyPlots = layoutsData.any((layout) =>
+              (layout['plots'] as List<dynamic>?)?.isNotEmpty ?? false);
+
+          if (hasAnyPlots) {
+            sourceLayouts = layoutsData;
+            print(
+                '✅ Using database layouts (has ${layoutsData.length} layouts with plots)');
+          } else {
+            print(
+                '⚠️ Database has layouts but no plots, will try local storage');
+          }
+
+          // Load agents from database
+          final agentsData = await _supabase
+              .from('agents')
+              .select('name')
+              .eq('project_id', widget.projectId!)
+              .order('created_at', ascending: true);
+
+          agents = agentsData
+              .map((a) => {
+                    'name': (a['name'] ?? '').toString(),
+                  })
+              .toList();
+
+          print(
+              'PlotStatusPage: Loaded ${sourceLayouts.length} layouts and ${agents.length} agents from database');
         }
-
-        // Load agents from database
-        final agentsData = await _supabase
-            .from('agents')
-            .select('name')
-            .eq('project_id', widget.projectId!)
-            .order('created_at', ascending: true);
-
-        agents = agentsData
-            .map((a) => {
-                  'name': (a['name'] ?? '').toString(),
-                })
-            .toList();
-
-        print(
-            'PlotStatusPage: Loaded ${sourceLayouts.length} layouts and ${agents.length} agents from database');
       } catch (e, stackTrace) {
         print('PlotStatusPage: Error loading from database: $e');
         print('Stack trace: $stackTrace');
@@ -1209,69 +1296,8 @@ class _PlotStatusPageState extends State<PlotStatusPage> {
   }
 
   Future<void> _savePlotsToDatabase() async {
-    // Save plot data (including agent, status, buyer, price, date) to Supabase
-    if (widget.projectId == null) return;
-
-    try {
-      _markUnsaved();
-      _setSaveStatus(ProjectSaveStatusType.saving);
-      final canSaveBuyerContactNumber = await _canSaveBuyerContactNumber();
-      for (var layout in _layouts) {
-        final layoutId = layout['layoutId'] as String?;
-        if (layoutId == null) continue;
-
-        final plots = layout['plots'] as List<dynamic>? ?? [];
-        for (var plot in plots) {
-          final plotId = plot['id'] as String?;
-          if (plotId == null) continue;
-
-          // Get values from the plot data
-          // Handle status - can be PlotStatus enum or string
-          final status =
-              _plotStatusToDatabaseValue(_parsePlotStatus(plot['status']));
-
-          final agent = (plot['agent'] as String? ?? '').toString().trim();
-          final buyerName =
-              (plot['buyerName'] as String? ?? '').toString().trim();
-          final salePrice = (plot['salePrice'] as String? ?? '')
-              .toString()
-              .replaceAll(',', '')
-              .replaceAll('₹', '')
-              .replaceAll(' ', '')
-              .trim();
-          final saleDate =
-              (plot['saleDate'] as String? ?? '').toString().trim();
-          final buyerContactNumber =
-              (plot['buyerContactNumber'] as String? ?? '').toString().trim();
-
-          final updateData = <String, dynamic>{
-            'status': status,
-            'agent_name': agent.isEmpty ? null : agent,
-            'buyer_name': buyerName.isEmpty ? null : buyerName,
-            'sale_price':
-                salePrice.isEmpty || salePrice == '0' || salePrice == '0.00'
-                    ? null
-                    : double.tryParse(salePrice),
-            'sale_date': saleDate.isEmpty ? null : saleDate,
-          };
-
-          if (canSaveBuyerContactNumber) {
-            updateData['buyer_contact_number'] =
-                buyerContactNumber.isEmpty ? null : buyerContactNumber;
-          }
-
-          // Update the plot in the database
-          await _supabase.from('plots').update(updateData).eq('id', plotId);
-        }
-      }
-      _hasUnsavedChanges = false;
-      await _markRemoteSaveTimestamp();
-      _setSaveStatus(ProjectSaveStatusType.saved);
-      print('Successfully saved plots to database');
-    } catch (e) {
-      _setSaveStatus(ProjectSaveStatusType.connectionLost);
-      print('Error saving plots to database: $e');
-    }
+    // Legacy direct row updates are disabled in encrypted-only storage mode.
+    return;
   }
 
   void _updatePlotStatus(int index, PlotStatus newStatus) {

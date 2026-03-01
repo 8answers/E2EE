@@ -13,8 +13,8 @@ void main() async {
 
   try {
     await Supabase.initialize(
-      url: 'https://dsbxgrkbmcnidlsykqwj.supabase.co',
-      anonKey: 'sb_publishable_BEJgmnl-V3uOLAwQr0qcnA_upzNyW9_',
+      url: 'https://vojqdspyeqvfcijqdjhw.supabase.co',
+      anonKey: 'sb_publishable_KFHLCChln7PwMNDpJQtxVQ_VW-lLf5o',
       authOptions: const FlutterAuthClientOptions(
         authFlowType: AuthFlowType.pkce,
       ),

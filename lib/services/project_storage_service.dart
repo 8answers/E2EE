@@ -1,8 +1,12 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import 'e2ee_crypto_service.dart';
+import 'secure_project_payload_service.dart';
+
 class ProjectStorageService {
   static final SupabaseClient _supabase = Supabase.instance.client;
   static bool? _hasBuyerContactNumberColumn;
+  static const bool _encryptedOnlyStorage = true;
 
   static Future<bool> _supportsBuyerContactNumberColumn() async {
     // Cache only successful detection. If previously false (e.g. column added
@@ -52,201 +56,275 @@ class ProjectStorageService {
         throw Exception('User not authenticated');
       }
 
-      // Fetch main project info
-      final project = await _supabase
-          .from('projects')
-          .select()
-          .eq('id', projectId)
-          .eq('user_id', userId)
-          .maybeSingle();
-      if (project == null) return null;
+      final encryptedRow = await SecureProjectPayloadService.fetchPayload(
+        projectId: projectId,
+        userId: userId,
+      );
+      Object? encryptedReadFailure;
+      if (encryptedRow != null) {
+        try {
+          final decrypted = await E2EECryptoService.decryptProjectPayload(
+            userId: userId,
+            projectId: projectId,
+            encryptedPayload: encryptedRow,
+          );
+          if (decrypted != null) {
+            return decrypted;
+          }
+          encryptedReadFailure = Exception(
+            'Encrypted payload exists but returned empty decrypted content.',
+          );
+        } on EncryptionKeyUnavailableException {
+          encryptedReadFailure = EncryptionKeyUnavailableException(
+            'Encrypted data exists but key is unavailable for this browser origin. '
+            'Open the app on the same URL/port used when data was saved.',
+          );
+        } catch (e) {
+          encryptedReadFailure = Exception(
+            'Encrypted payload decrypt failed for project $projectId: $e',
+          );
+        }
 
-      // Fetch related data
-      final partners = await _supabase
-          .from('partners')
-          .select()
-          .eq('project_id', projectId)
-          .order('created_at', ascending: true)
-          .order('id', ascending: true);
-
-      final expenses = await _supabase
-          .from('expenses')
-          .select()
-          .eq('project_id', projectId)
-          .order('created_at', ascending: true)
-          .order('id', ascending: true);
-
-      final nonSellableAreas = await _supabase
-          .from('non_sellable_areas')
-          .select()
-          .eq('project_id', projectId);
-
-      final layouts =
-          await _supabase.from('layouts').select().eq('project_id', projectId);
-
-      final projectManagers = await _supabase
-          .from('project_managers')
-          .select()
-          .eq('project_id', projectId);
-
-      final agents =
-          await _supabase.from('agents').select().eq('project_id', projectId);
-
-      // Fetch all plots for calculations
-      final plots = <Map<String, dynamic>>[];
-      final plotIds = <String>[];
-      for (var layout in layouts) {
-        final layoutPlots = await _supabase
-            .from('plots')
-            .select()
-            .eq('layout_id', layout['id'] as String);
-        plots.addAll(layoutPlots);
-        for (var p in layoutPlots) {
-          if (p['id'] != null) plotIds.add(p['id'].toString());
+        // Never fallback to relational in encrypted-only mode when encrypted
+        // payload exists but cannot be read; doing so can overwrite ciphertext
+        // with partial (metadata-only) project data.
+        if (_encryptedOnlyStorage) {
+          throw encryptedReadFailure;
         }
       }
 
-      // Fetch plot_partners for all plots
-      List<Map<String, dynamic>> plotPartners = [];
-      if (plotIds.isNotEmpty) {
-        plotPartners = await _supabase
-            .from('plot_partners')
-            .select('plot_id, partner_name')
-            .inFilter('plot_id', plotIds);
+      final relationalData = await _fetchProjectDataFromRelationalTables(
+        projectId: projectId,
+        userId: userId,
+      );
+      if (relationalData != null &&
+          _encryptedOnlyStorage &&
+          encryptedRow == null) {
+        try {
+          final secureTableAvailable =
+              await SecureProjectPayloadService.isSecurePayloadTableAvailable();
+          if (secureTableAvailable) {
+            final encryptedPayload =
+                await E2EECryptoService.encryptProjectPayload(
+              userId: userId,
+              projectId: projectId,
+              payload: relationalData,
+            );
+            await SecureProjectPayloadService.upsertPayload(
+              projectId: projectId,
+              userId: userId,
+              encryptedPayload: encryptedPayload,
+            );
+            await _purgePlaintextProjectRows(projectId);
+          }
+        } catch (e) {
+          print(
+              'Error auto-migrating project $projectId to encrypted storage: $e');
+        }
       }
-
-      // Calculate totals
-      final totalArea = (project['total_area'] as num?)?.toDouble() ?? 0.0;
-      final sellingArea = (project['selling_area'] as num?)?.toDouble() ?? 0.0;
-      final estimatedCost =
-          (project['estimated_development_cost'] as num?)?.toDouble() ?? 0.0;
-      final nonSellableArea = nonSellableAreas.fold<double>(
-        0.0,
-        (sum, area) => sum + ((area['area'] as num?)?.toDouble() ?? 0.0),
-      );
-
-      // Calculate total expenses
-      final totalExpenses = expenses.fold<double>(
-        0.0,
-        (sum, expense) =>
-            sum + ((expense['amount'] as num?)?.toDouble() ?? 0.0),
-      );
-
-      // Calculate plot statistics
-      final totalPlots = plots.length;
-      final soldPlots = plots.where((p) => p['status'] == 'sold').length;
-      final availablePlots =
-          plots.where((p) => p['status'] == 'available').length;
-
-      // Calculate all-in cost (weighted average per sqft)
-      final totalPlotArea = plots.fold<double>(
-        0.0,
-        (sum, plot) => sum + ((plot['area'] as num?)?.toDouble() ?? 0.0),
-      );
-      final allInCostTotal = plots.fold<double>(
-        0.0,
-        (sum, plot) {
-          final area = ((plot['area'] as num?)?.toDouble() ?? 0.0);
-          final costPerSqft =
-              ((plot['all_in_cost_per_sqft'] as num?)?.toDouble() ?? 0.0);
-          return sum + (area * costPerSqft);
-        },
-      );
-      final allInCost =
-          totalPlotArea > 0 ? allInCostTotal / totalPlotArea : 0.0;
-
-      // Calculate sales value
-      final totalSalesValue =
-          plots.where((p) => p['status'] == 'sold').fold<double>(
-        0.0,
-        (sum, plot) {
-          final salePrice = ((plot['sale_price'] as num?)?.toDouble() ?? 0.0);
-          final area = ((plot['area'] as num?)?.toDouble() ?? 0.0);
-          return sum + (salePrice * area);
-        },
-      );
-
-      // Calculate average sales price
-      final totalSalePriceSum =
-          plots.where((p) => p['status'] == 'sold').fold<double>(
-                0.0,
-                (sum, plot) =>
-                    sum + ((plot['sale_price'] as num?)?.toDouble() ?? 0.0),
-              );
-      final avgSalesPrice = soldPlots > 0 ? totalSalePriceSum / soldPlots : 0.0;
-
-      // Calculate compensation totals
-      final totalPMCompensation = projectManagers.fold<double>(
-        0.0,
-        (sum, pm) => sum + ((pm['fee'] as num?)?.toDouble() ?? 0.0),
-      );
-
-      final totalAgentCompensation = agents.fold<double>(
-        0.0,
-        (sum, agent) => sum + ((agent['fee'] as num?)?.toDouble() ?? 0.0),
-      );
-
-      final totalCompensation = totalPMCompensation + totalAgentCompensation;
-
-      // Calculate profitability metrics using plot-based gross profit (same as dashboard)
-      // Gross Profit = For each SOLD plot: (sale_price × area) - (area × all_in_cost)
-      final grossProfit =
-          plots.where((p) => p['status'] == 'sold').fold<double>(
-        0.0,
-        (sum, plot) {
-          final salePrice = ((plot['sale_price'] as num?)?.toDouble() ?? 0.0);
-          final area = ((plot['area'] as num?)?.toDouble() ?? 0.0);
-          final allInCostPerSqft =
-              ((plot['all_in_cost_per_sqft'] as num?)?.toDouble() ?? 0.0);
-          final plotProfit = (salePrice * area) - (area * allInCostPerSqft);
-          return sum + plotProfit;
-        },
-      );
-      final netProfit = grossProfit - totalCompensation;
-      final profitMargin =
-          totalSalesValue > 0 ? ((netProfit / totalSalesValue) * 100) : 0.0;
-      final roi = estimatedCost > 0 ? ((netProfit / estimatedCost) * 100) : 0.0;
-
-      // Compose result in the same structure as used in the report
-      return {
-        'projectName': project['project_name'],
-        'projectStatus': project['project_status'],
-        'projectAddress': project['project_address'] ?? project['address'],
-        'googleMapsLink': project['google_maps_link'] ??
-            project['maps_link'] ??
-            project['location_link'],
-        'totalArea': totalArea.toStringAsFixed(2),
-        'sellingArea': sellingArea.toStringAsFixed(2),
-        'estimatedDevelopmentCost': estimatedCost.toStringAsFixed(2),
-        'nonSellableArea': nonSellableArea.toStringAsFixed(2),
-        'allInCost': allInCost.toStringAsFixed(2),
-        'totalExpenses': totalExpenses.toStringAsFixed(2),
-        'totalLayouts': layouts.length,
-        'totalPlots': totalPlots,
-        'soldPlots': soldPlots,
-        'availablePlots': availablePlots,
-        'totalSalesValue': totalSalesValue.toStringAsFixed(2),
-        'avgSalesPrice': avgSalesPrice.toStringAsFixed(2),
-        'grossProfit': grossProfit.toStringAsFixed(2),
-        'netProfit': netProfit.toStringAsFixed(2),
-        'profitMargin': profitMargin.toStringAsFixed(2),
-        'roi': roi.toStringAsFixed(2),
-        'totalPMCompensation': totalPMCompensation.toStringAsFixed(2),
-        'totalAgentCompensation': totalAgentCompensation.toStringAsFixed(2),
-        'totalCompensation': totalCompensation.toStringAsFixed(2),
-        'partners': partners,
-        'expenses': expenses,
-        'nonSellableAreas': nonSellableAreas,
-        'plots': plots,
-        'layouts': layouts,
-        'project_managers': projectManagers,
-        'agents': agents,
-        'plot_partners': plotPartners,
-      };
+      return relationalData;
     } catch (e) {
+      if (e is EncryptionKeyUnavailableException ||
+          (_encryptedOnlyStorage &&
+              e.toString().toLowerCase().contains('encrypted payload'))) {
+        rethrow;
+      }
       print('Error fetching project data: $e');
       return null;
     }
+  }
+
+  static Future<Map<String, dynamic>?> _fetchProjectDataFromRelationalTables({
+    required String projectId,
+    required String userId,
+  }) async {
+    // Fetch main project info
+    final project = await _supabase
+        .from('projects')
+        .select()
+        .eq('id', projectId)
+        .eq('user_id', userId)
+        .maybeSingle();
+    if (project == null) return null;
+
+    // Fetch related data
+    final partners = await _supabase
+        .from('partners')
+        .select()
+        .eq('project_id', projectId)
+        .order('created_at', ascending: true)
+        .order('id', ascending: true);
+
+    final expenses = await _supabase
+        .from('expenses')
+        .select()
+        .eq('project_id', projectId)
+        .order('created_at', ascending: true)
+        .order('id', ascending: true);
+
+    final nonSellableAreas = await _supabase
+        .from('non_sellable_areas')
+        .select()
+        .eq('project_id', projectId);
+
+    final layouts =
+        await _supabase.from('layouts').select().eq('project_id', projectId);
+
+    final projectManagers = await _supabase
+        .from('project_managers')
+        .select()
+        .eq('project_id', projectId);
+
+    final agents =
+        await _supabase.from('agents').select().eq('project_id', projectId);
+
+    // Fetch all plots for calculations
+    final plots = <Map<String, dynamic>>[];
+    final plotIds = <String>[];
+    for (var layout in layouts) {
+      final layoutPlots = await _supabase
+          .from('plots')
+          .select()
+          .eq('layout_id', layout['id'] as String);
+      plots.addAll(layoutPlots);
+      for (var p in layoutPlots) {
+        if (p['id'] != null) plotIds.add(p['id'].toString());
+      }
+    }
+
+    // Fetch plot_partners for all plots
+    List<Map<String, dynamic>> plotPartners = [];
+    if (plotIds.isNotEmpty) {
+      plotPartners = await _supabase
+          .from('plot_partners')
+          .select('plot_id, partner_name')
+          .inFilter('plot_id', plotIds);
+    }
+
+    // Calculate totals
+    final totalArea = (project['total_area'] as num?)?.toDouble() ?? 0.0;
+    final sellingArea = (project['selling_area'] as num?)?.toDouble() ?? 0.0;
+    final estimatedCost =
+        (project['estimated_development_cost'] as num?)?.toDouble() ?? 0.0;
+    final nonSellableArea = nonSellableAreas.fold<double>(
+      0.0,
+      (sum, area) => sum + ((area['area'] as num?)?.toDouble() ?? 0.0),
+    );
+
+    // Calculate total expenses
+    final totalExpenses = expenses.fold<double>(
+      0.0,
+      (sum, expense) => sum + ((expense['amount'] as num?)?.toDouble() ?? 0.0),
+    );
+
+    // Calculate plot statistics
+    final totalPlots = plots.length;
+    final soldPlots = plots.where((p) => p['status'] == 'sold').length;
+    final availablePlots =
+        plots.where((p) => p['status'] == 'available').length;
+
+    // Calculate all-in cost (weighted average per sqft)
+    final totalPlotArea = plots.fold<double>(
+      0.0,
+      (sum, plot) => sum + ((plot['area'] as num?)?.toDouble() ?? 0.0),
+    );
+    final allInCostTotal = plots.fold<double>(
+      0.0,
+      (sum, plot) {
+        final area = ((plot['area'] as num?)?.toDouble() ?? 0.0);
+        final costPerSqft =
+            ((plot['all_in_cost_per_sqft'] as num?)?.toDouble() ?? 0.0);
+        return sum + (area * costPerSqft);
+      },
+    );
+    final allInCost = totalPlotArea > 0 ? allInCostTotal / totalPlotArea : 0.0;
+
+    // Calculate sales value
+    final totalSalesValue =
+        plots.where((p) => p['status'] == 'sold').fold<double>(
+      0.0,
+      (sum, plot) {
+        final salePrice = ((plot['sale_price'] as num?)?.toDouble() ?? 0.0);
+        final area = ((plot['area'] as num?)?.toDouble() ?? 0.0);
+        return sum + (salePrice * area);
+      },
+    );
+
+    // Calculate average sales price
+    final totalSalePriceSum =
+        plots.where((p) => p['status'] == 'sold').fold<double>(
+              0.0,
+              (sum, plot) =>
+                  sum + ((plot['sale_price'] as num?)?.toDouble() ?? 0.0),
+            );
+    final avgSalesPrice = soldPlots > 0 ? totalSalePriceSum / soldPlots : 0.0;
+
+    // Calculate compensation totals
+    final totalPMCompensation = projectManagers.fold<double>(
+      0.0,
+      (sum, pm) => sum + ((pm['fee'] as num?)?.toDouble() ?? 0.0),
+    );
+
+    final totalAgentCompensation = agents.fold<double>(
+      0.0,
+      (sum, agent) => sum + ((agent['fee'] as num?)?.toDouble() ?? 0.0),
+    );
+
+    final totalCompensation = totalPMCompensation + totalAgentCompensation;
+
+    // Gross Profit = For each SOLD plot: (sale_price × area) - (area × all_in_cost)
+    final grossProfit = plots.where((p) => p['status'] == 'sold').fold<double>(
+      0.0,
+      (sum, plot) {
+        final salePrice = ((plot['sale_price'] as num?)?.toDouble() ?? 0.0);
+        final area = ((plot['area'] as num?)?.toDouble() ?? 0.0);
+        final allInCostPerSqft =
+            ((plot['all_in_cost_per_sqft'] as num?)?.toDouble() ?? 0.0);
+        final plotProfit = (salePrice * area) - (area * allInCostPerSqft);
+        return sum + plotProfit;
+      },
+    );
+    final netProfit = grossProfit - totalCompensation;
+    final profitMargin =
+        totalSalesValue > 0 ? ((netProfit / totalSalesValue) * 100) : 0.0;
+    final roi = estimatedCost > 0 ? ((netProfit / estimatedCost) * 100) : 0.0;
+
+    // Compose result in the same structure as used in the report
+    return {
+      'projectName': project['project_name'],
+      'projectStatus': project['project_status'],
+      'projectAddress': project['project_address'] ?? project['address'],
+      'googleMapsLink': project['google_maps_link'] ??
+          project['maps_link'] ??
+          project['location_link'],
+      'totalArea': totalArea.toStringAsFixed(2),
+      'sellingArea': sellingArea.toStringAsFixed(2),
+      'estimatedDevelopmentCost': estimatedCost.toStringAsFixed(2),
+      'nonSellableArea': nonSellableArea.toStringAsFixed(2),
+      'allInCost': allInCost.toStringAsFixed(2),
+      'totalExpenses': totalExpenses.toStringAsFixed(2),
+      'totalLayouts': layouts.length,
+      'totalPlots': totalPlots,
+      'soldPlots': soldPlots,
+      'availablePlots': availablePlots,
+      'totalSalesValue': totalSalesValue.toStringAsFixed(2),
+      'avgSalesPrice': avgSalesPrice.toStringAsFixed(2),
+      'grossProfit': grossProfit.toStringAsFixed(2),
+      'netProfit': netProfit.toStringAsFixed(2),
+      'profitMargin': profitMargin.toStringAsFixed(2),
+      'roi': roi.toStringAsFixed(2),
+      'totalPMCompensation': totalPMCompensation.toStringAsFixed(2),
+      'totalAgentCompensation': totalAgentCompensation.toStringAsFixed(2),
+      'totalCompensation': totalCompensation.toStringAsFixed(2),
+      'partners': partners,
+      'expenses': expenses,
+      'nonSellableAreas': nonSellableAreas,
+      'plots': plots,
+      'layouts': layouts,
+      'project_managers': projectManagers,
+      'agents': agents,
+      'plot_partners': plotPartners,
+    };
   }
 
   /// Save complete project data to Supabase
@@ -270,6 +348,27 @@ class ProjectStorageService {
       final userId = _supabase.auth.currentUser?.id;
       if (userId == null) {
         throw Exception('User not authenticated');
+      }
+
+      if (_encryptedOnlyStorage) {
+        await _saveEncryptedOnlyProjectData(
+          projectId: projectId,
+          userId: userId,
+          projectName: projectName,
+          projectStatus: projectStatus,
+          projectAddress: projectAddress,
+          googleMapsLink: googleMapsLink,
+          totalArea: totalArea,
+          sellingArea: sellingArea,
+          estimatedDevelopmentCost: estimatedDevelopmentCost,
+          nonSellableAreas: nonSellableAreas,
+          partners: partners,
+          expenses: expenses,
+          layouts: layouts,
+          projectManagers: projectManagers,
+          agents: agents,
+        );
+        return;
       }
 
       // Get current project to check existing name
@@ -422,9 +521,498 @@ class ProjectStorageService {
         throw Exception(
             'Partial save failure for project $projectId -> ${sectionErrors.join(' | ')}');
       }
+
+      await _refreshEncryptedProjectSnapshot(
+        projectId: projectId,
+        userId: userId,
+      );
     } catch (e) {
       print('Error saving project data: $e');
       rethrow;
+    }
+  }
+
+  static Future<void> _refreshEncryptedProjectSnapshot({
+    required String projectId,
+    required String userId,
+  }) async {
+    try {
+      final projectData = await _fetchProjectDataFromRelationalTables(
+        projectId: projectId,
+        userId: userId,
+      );
+      if (projectData == null) return;
+      final encryptedPayload = await E2EECryptoService.encryptProjectPayload(
+        userId: userId,
+        projectId: projectId,
+        payload: projectData,
+      );
+      await SecureProjectPayloadService.upsertPayload(
+        projectId: projectId,
+        userId: userId,
+        encryptedPayload: encryptedPayload,
+      );
+    } catch (e) {
+      // Keep relational save path resilient while encrypted storage is rolled out.
+      print('Error refreshing encrypted project snapshot: $e');
+    }
+  }
+
+  static Future<void> _saveEncryptedOnlyProjectData({
+    required String projectId,
+    required String userId,
+    String? projectName,
+    String? projectStatus,
+    String? projectAddress,
+    String? googleMapsLink,
+    String? totalArea,
+    String? sellingArea,
+    String? estimatedDevelopmentCost,
+    List<Map<String, String>>? nonSellableAreas,
+    List<Map<String, dynamic>>? partners,
+    List<Map<String, dynamic>>? expenses,
+    List<Map<String, dynamic>>? layouts,
+    List<Map<String, dynamic>>? projectManagers,
+    List<Map<String, dynamic>>? agents,
+  }) async {
+    final secureTableAvailable =
+        await SecureProjectPayloadService.isSecurePayloadTableAvailable();
+    if (!secureTableAvailable) {
+      throw Exception(
+          'Encrypted storage table is missing. Run migration_create_project_secure_payloads.sql before saving.');
+    }
+
+    final existingSnapshot =
+        await fetchProjectDataById(projectId) ?? <String, dynamic>{};
+    final merged = Map<String, dynamic>.from(existingSnapshot);
+
+    if ((projectName ?? '').trim().isNotEmpty) {
+      merged['projectName'] = projectName!.trim();
+    } else {
+      merged['projectName'] = (merged['projectName'] ?? '').toString().trim();
+    }
+    if (projectStatus != null) {
+      merged['projectStatus'] = projectStatus.trim();
+    } else {
+      merged['projectStatus'] =
+          (merged['projectStatus'] ?? 'Active').toString();
+    }
+    if (projectAddress != null) {
+      merged['projectAddress'] = projectAddress.trim();
+    } else {
+      merged['projectAddress'] = (merged['projectAddress'] ?? '').toString();
+    }
+    if (googleMapsLink != null) {
+      merged['googleMapsLink'] = googleMapsLink.trim();
+    } else {
+      merged['googleMapsLink'] = (merged['googleMapsLink'] ?? '').toString();
+    }
+
+    final existingTotalArea = _toDouble(merged['totalArea']);
+    final existingSellingArea = _toDouble(merged['sellingArea']);
+    final existingEstimatedCost = _toDouble(merged['estimatedDevelopmentCost']);
+    final mergedTotalArea = (totalArea != null && totalArea.trim().isNotEmpty)
+        ? _parseDecimal(totalArea)
+        : existingTotalArea;
+    final mergedSellingArea =
+        (sellingArea != null && sellingArea.trim().isNotEmpty)
+            ? _parseDecimal(sellingArea)
+            : existingSellingArea;
+    final mergedEstimatedCost = (estimatedDevelopmentCost != null &&
+            estimatedDevelopmentCost.trim().isNotEmpty)
+        ? _parseDecimal(estimatedDevelopmentCost)
+        : existingEstimatedCost;
+    merged['totalArea'] = mergedTotalArea.toStringAsFixed(2);
+    merged['sellingArea'] = mergedSellingArea.toStringAsFixed(2);
+    merged['estimatedDevelopmentCost'] = mergedEstimatedCost.toStringAsFixed(2);
+
+    if (nonSellableAreas != null) {
+      merged['nonSellableAreas'] = nonSellableAreas
+          .map((area) => <String, dynamic>{
+                'name': (area['name'] ?? '').trim(),
+                'area': _parseDecimal(area['area']),
+              })
+          .where((area) =>
+              (area['name'] as String).isNotEmpty ||
+              (_toDouble(area['area']) > 0))
+          .toList();
+    } else {
+      merged['nonSellableAreas'] =
+          _normalizeMapList(merged['nonSellableAreas']);
+    }
+
+    if (partners != null) {
+      merged['partners'] = partners
+          .map((partner) => <String, dynamic>{
+                'id': (partner['id'] ?? '').toString(),
+                'name': (partner['name'] ?? '').toString().trim(),
+                'amount': _toDouble(partner['amount']),
+              })
+          .where((partner) =>
+              (partner['name'] as String).isNotEmpty ||
+              _toDouble(partner['amount']) > 0)
+          .toList();
+    } else {
+      merged['partners'] = _normalizeMapList(merged['partners']);
+    }
+
+    if (expenses != null) {
+      merged['expenses'] = expenses
+          .map((expense) => <String, dynamic>{
+                'id': (expense['id'] ?? '').toString(),
+                'item': (expense['item'] ?? '').toString().trim(),
+                'category': (expense['category'] ?? '').toString().trim(),
+                'amount': _toDouble(expense['amount']),
+              })
+          .where((expense) =>
+              (expense['item'] as String).isNotEmpty ||
+              (expense['category'] as String).isNotEmpty ||
+              _toDouble(expense['amount']) > 0)
+          .toList();
+    } else {
+      merged['expenses'] = _normalizeMapList(merged['expenses']);
+    }
+
+    if (layouts != null) {
+      final normalizedLayoutsData =
+          _normalizeLayoutsForEncryptedSnapshot(layouts);
+      merged['layouts'] = normalizedLayoutsData['layouts'];
+      merged['plots'] = normalizedLayoutsData['plots'];
+      merged['plot_partners'] = normalizedLayoutsData['plot_partners'];
+    } else {
+      merged['layouts'] = _normalizeMapList(merged['layouts']);
+      merged['plots'] = _normalizeMapList(merged['plots']);
+      merged['plot_partners'] = _normalizeMapList(merged['plot_partners']);
+    }
+
+    if (projectManagers != null) {
+      merged['project_managers'] = projectManagers
+          .map((manager) => _normalizeCompensationPersonRow(manager))
+          .toList();
+    } else {
+      merged['project_managers'] =
+          _normalizeMapList(merged['project_managers']);
+    }
+
+    if (agents != null) {
+      merged['agents'] = agents
+          .map((agent) => _normalizeCompensationPersonRow(agent))
+          .toList();
+    } else {
+      merged['agents'] = _normalizeMapList(merged['agents']);
+    }
+
+    _recomputeDerivedSnapshotFields(merged);
+
+    final encryptedPayload = await E2EECryptoService.encryptProjectPayload(
+      userId: userId,
+      projectId: projectId,
+      payload: merged,
+    );
+    await SecureProjectPayloadService.upsertPayload(
+      projectId: projectId,
+      userId: userId,
+      encryptedPayload: encryptedPayload,
+    );
+
+    final metadataUpdate = <String, dynamic>{
+      'updated_at': DateTime.now().toIso8601String(),
+      'total_area': 0.0,
+      'selling_area': 0.0,
+      'estimated_development_cost': 0.0,
+      'project_address': '',
+      'google_maps_link': '',
+    };
+    final safeProjectName = (merged['projectName'] ?? '').toString().trim();
+    if (safeProjectName.isNotEmpty) {
+      metadataUpdate['project_name'] = safeProjectName;
+    }
+    metadataUpdate['project_status'] =
+        (merged['projectStatus'] ?? 'Active').toString();
+
+    await _supabase
+        .from('projects')
+        .update(metadataUpdate)
+        .eq('id', projectId)
+        .eq('user_id', userId);
+
+    await _purgePlaintextProjectRows(projectId);
+  }
+
+  static Map<String, List<Map<String, dynamic>>>
+      _normalizeLayoutsForEncryptedSnapshot(
+    List<Map<String, dynamic>> layouts,
+  ) {
+    final normalizedLayouts = <Map<String, dynamic>>[];
+    final normalizedPlots = <Map<String, dynamic>>[];
+    final normalizedPlotPartners = <Map<String, dynamic>>[];
+
+    for (int layoutIndex = 0; layoutIndex < layouts.length; layoutIndex++) {
+      final rawLayout = layouts[layoutIndex];
+      final layoutName = (rawLayout['name'] ?? '').toString().trim();
+      final layoutId = (rawLayout['id'] ?? '').toString().trim().isNotEmpty
+          ? rawLayout['id'].toString().trim()
+          : 'enc_layout_$layoutIndex';
+      normalizedLayouts.add({
+        'id': layoutId,
+        'name': layoutName,
+      });
+
+      final plots = (rawLayout['plots'] as List<dynamic>? ?? const []);
+      for (int plotIndex = 0; plotIndex < plots.length; plotIndex++) {
+        final rawPlot = (plots[plotIndex] as Map?)?.cast<String, dynamic>() ??
+            <String, dynamic>{};
+        final plotNumber = (rawPlot['plotNumber'] ?? '').toString().trim();
+        if (plotNumber.isEmpty) continue;
+        final plotId = (rawPlot['id'] ?? '').toString().trim().isNotEmpty
+            ? rawPlot['id'].toString().trim()
+            : '${layoutId}_plot_$plotIndex';
+
+        final normalizedStatus =
+            _normalizePlotStatusForDatabase(rawPlot['status']).toString();
+        final payments = (rawPlot['payments'] as List<dynamic>? ?? const []);
+        final salePrice = _toDouble(rawPlot['salePrice']);
+
+        normalizedPlots.add({
+          'id': plotId,
+          'layout_id': layoutId,
+          'plot_number': plotNumber,
+          'area': _toDouble(rawPlot['area']),
+          'all_in_cost_per_sqft': _toDouble(rawPlot['purchaseRate']),
+          'total_plot_cost': _toDouble(rawPlot['totalPlotCost']),
+          'status': normalizedStatus,
+          'sale_price': salePrice <= 0 ? null : salePrice,
+          'buyer_name': _nullIfEmpty(rawPlot['buyerName']),
+          'buyer_contact_number': _nullIfEmpty(rawPlot['buyerContactNumber']),
+          'sale_date': _parseDate(rawPlot['saleDate']?.toString()),
+          'agent_name': _nullIfEmpty(rawPlot['agent']),
+          'payments': payments,
+        });
+
+        final partners = (rawPlot['partners'] as List<dynamic>? ?? const [])
+            .map((e) => e.toString().trim())
+            .where((e) => e.isNotEmpty)
+            .toSet();
+        for (final partner in partners) {
+          normalizedPlotPartners.add({
+            'plot_id': plotId,
+            'partner_name': partner,
+          });
+        }
+      }
+    }
+
+    return {
+      'layouts': normalizedLayouts,
+      'plots': normalizedPlots,
+      'plot_partners': normalizedPlotPartners,
+    };
+  }
+
+  static Map<String, dynamic> _normalizeCompensationPersonRow(
+      Map<String, dynamic> input) {
+    final compensationType =
+        (input['compensation_type'] ?? input['compensation'] ?? '')
+            .toString()
+            .trim();
+    final earningType =
+        (input['earning_type'] ?? input['earningType'] ?? '').toString().trim();
+    final selectedBlocksRaw =
+        input['selectedBlocks'] ?? input['selected_blocks'] ?? const [];
+    final selectedBlocks =
+        (selectedBlocksRaw is List ? selectedBlocksRaw : const <dynamic>[])
+            .map((e) => e.toString().trim())
+            .where((e) => e.isNotEmpty)
+            .toList();
+    return {
+      'id': (input['id'] ?? '').toString(),
+      'name': (input['name'] ?? '').toString().trim(),
+      'compensation_type': compensationType,
+      'earning_type': earningType,
+      'percentage': _toDouble(input['percentage']),
+      'fixed_fee': _toDouble(input['fixed_fee'] ?? input['fixedFee']),
+      'monthly_fee': _toDouble(input['monthly_fee'] ?? input['monthlyFee']),
+      'months': _toInt(input['months']),
+      'per_sqft_fee': _toDouble(input['per_sqft_fee'] ?? input['perSqftFee']),
+      'selected_blocks': selectedBlocks,
+    };
+  }
+
+  static void _recomputeDerivedSnapshotFields(Map<String, dynamic> payload) {
+    final layouts = _normalizeMapList(payload['layouts']);
+    final plots = _normalizeMapList(payload['plots']);
+    final partners = _normalizeMapList(payload['partners']);
+    final expenses = _normalizeMapList(payload['expenses']);
+    final nonSellableAreas = _normalizeMapList(payload['nonSellableAreas']);
+    final projectManagers = _normalizeMapList(payload['project_managers']);
+    final agents = _normalizeMapList(payload['agents']);
+
+    final totalExpenses = expenses.fold<double>(
+        0.0, (sum, row) => sum + _toDouble(row['amount']));
+    final nonSellableArea = nonSellableAreas.fold<double>(
+      0.0,
+      (sum, row) => sum + _toDouble(row['area']),
+    );
+    final totalPlots = plots.length;
+    final soldPlots = plots
+        .where(
+            (row) => (row['status'] ?? '').toString().toLowerCase() == 'sold')
+        .length;
+    final availablePlots = plots
+        .where((row) =>
+            (row['status'] ?? '').toString().toLowerCase() == 'available')
+        .length;
+
+    final totalPlotArea =
+        plots.fold<double>(0.0, (sum, row) => sum + _toDouble(row['area']));
+    final allInCostTotal = plots.fold<double>(
+      0.0,
+      (sum, row) =>
+          sum +
+          (_toDouble(row['area']) * _toDouble(row['all_in_cost_per_sqft'])),
+    );
+    final allInCost = totalPlotArea > 0 ? allInCostTotal / totalPlotArea : 0.0;
+
+    final soldOnly = plots
+        .where(
+            (row) => (row['status'] ?? '').toString().toLowerCase() == 'sold')
+        .toList();
+    final totalSalesValue = soldOnly.fold<double>(
+      0.0,
+      (sum, row) =>
+          sum + (_toDouble(row['sale_price']) * _toDouble(row['area'])),
+    );
+    final avgSalesPrice = soldOnly.isEmpty
+        ? 0.0
+        : soldOnly.fold<double>(
+                0.0, (sum, row) => sum + _toDouble(row['sale_price'])) /
+            soldOnly.length;
+    final grossProfit = soldOnly.fold<double>(
+      0.0,
+      (sum, row) =>
+          sum +
+          ((_toDouble(row['sale_price']) * _toDouble(row['area'])) -
+              (_toDouble(row['area']) *
+                  _toDouble(row['all_in_cost_per_sqft']))),
+    );
+    final totalPMCompensation = projectManagers.fold<double>(
+        0.0, (sum, row) => sum + _toDouble(row['fee']));
+    final totalAgentCompensation =
+        agents.fold<double>(0.0, (sum, row) => sum + _toDouble(row['fee']));
+    final totalCompensation = totalPMCompensation + totalAgentCompensation;
+    final netProfit = grossProfit - totalCompensation;
+    final profitMargin =
+        totalSalesValue > 0 ? (netProfit / totalSalesValue) * 100 : 0.0;
+    final estimatedDevelopmentCost =
+        _toDouble(payload['estimatedDevelopmentCost']);
+    final roi = estimatedDevelopmentCost > 0
+        ? (netProfit / estimatedDevelopmentCost) * 100
+        : 0.0;
+
+    payload['totalExpenses'] = totalExpenses.toStringAsFixed(2);
+    payload['nonSellableArea'] = nonSellableArea.toStringAsFixed(2);
+    payload['allInCost'] = allInCost.toStringAsFixed(2);
+    payload['totalLayouts'] = layouts.length;
+    payload['totalPlots'] = totalPlots;
+    payload['soldPlots'] = soldPlots;
+    payload['availablePlots'] = availablePlots;
+    payload['totalSalesValue'] = totalSalesValue.toStringAsFixed(2);
+    payload['avgSalesPrice'] = avgSalesPrice.toStringAsFixed(2);
+    payload['grossProfit'] = grossProfit.toStringAsFixed(2);
+    payload['netProfit'] = netProfit.toStringAsFixed(2);
+    payload['profitMargin'] = profitMargin.toStringAsFixed(2);
+    payload['roi'] = roi.toStringAsFixed(2);
+    payload['totalPMCompensation'] = totalPMCompensation.toStringAsFixed(2);
+    payload['totalAgentCompensation'] =
+        totalAgentCompensation.toStringAsFixed(2);
+    payload['totalCompensation'] = totalCompensation.toStringAsFixed(2);
+
+    // Keep normalized lists in payload
+    payload['layouts'] = layouts;
+    payload['plots'] = plots;
+    payload['partners'] = partners;
+    payload['expenses'] = expenses;
+    payload['nonSellableAreas'] = nonSellableAreas;
+    payload['project_managers'] = projectManagers;
+    payload['agents'] = agents;
+  }
+
+  static Future<void> _purgePlaintextProjectRows(String projectId) async {
+    try {
+      final layouts = await _supabase
+          .from('layouts')
+          .select('id')
+          .eq('project_id', projectId);
+      final layoutIds = layouts
+          .map((row) => (row['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toList();
+
+      final plots = layoutIds.isEmpty
+          ? <Map<String, dynamic>>[]
+          : await _supabase
+              .from('plots')
+              .select('id')
+              .inFilter('layout_id', layoutIds);
+      final plotIds = plots
+          .map((row) => (row['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toList();
+
+      final managers = await _supabase
+          .from('project_managers')
+          .select('id')
+          .eq('project_id', projectId);
+      final managerIds = managers
+          .map((row) => (row['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toList();
+
+      final agents = await _supabase
+          .from('agents')
+          .select('id')
+          .eq('project_id', projectId);
+      final agentIds = agents
+          .map((row) => (row['id'] ?? '').toString())
+          .where((id) => id.isNotEmpty)
+          .toList();
+
+      if (plotIds.isNotEmpty) {
+        await _supabase
+            .from('plot_partners')
+            .delete()
+            .inFilter('plot_id', plotIds);
+      }
+      if (managerIds.isNotEmpty) {
+        await _supabase
+            .from('project_manager_blocks')
+            .delete()
+            .inFilter('project_manager_id', managerIds);
+      }
+      if (agentIds.isNotEmpty) {
+        await _supabase
+            .from('agent_blocks')
+            .delete()
+            .inFilter('agent_id', agentIds);
+      }
+
+      await _supabase
+          .from('non_sellable_areas')
+          .delete()
+          .eq('project_id', projectId);
+      await _supabase.from('partners').delete().eq('project_id', projectId);
+      await _supabase.from('expenses').delete().eq('project_id', projectId);
+      await _supabase
+          .from('project_managers')
+          .delete()
+          .eq('project_id', projectId);
+      await _supabase.from('agents').delete().eq('project_id', projectId);
+      if (layoutIds.isNotEmpty) {
+        await _supabase.from('plots').delete().inFilter('layout_id', layoutIds);
+      }
+      await _supabase.from('layouts').delete().eq('project_id', projectId);
+    } catch (e) {
+      print('Error purging plaintext project rows for $projectId: $e');
     }
   }
 
@@ -1498,6 +2086,32 @@ class ProjectStorageService {
 
   static String _normalizeUniqueName(String value) {
     return value.trim().toLowerCase();
+  }
+
+  static List<Map<String, dynamic>> _normalizeMapList(dynamic raw) {
+    if (raw is! List) return <Map<String, dynamic>>[];
+    return raw.whereType<Map>().map((e) => e.cast<String, dynamic>()).toList();
+  }
+
+  static double _toDouble(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is num) return value.toDouble();
+    final cleaned =
+        value.toString().replaceAll(',', '').replaceAll('₹', '').trim();
+    return double.tryParse(cleaned) ?? 0.0;
+  }
+
+  static int _toInt(dynamic value) {
+    if (value == null) return 0;
+    if (value is int) return value;
+    if (value is num) return value.toInt();
+    final cleaned = value.toString().replaceAll(RegExp(r'[^\d-]'), '').trim();
+    return int.tryParse(cleaned) ?? 0;
+  }
+
+  static String? _nullIfEmpty(dynamic value) {
+    final text = (value ?? '').toString().trim();
+    return text.isEmpty ? null : text;
   }
 
   static int? _parseInt(String? value) {
