@@ -1963,12 +1963,33 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       _baseAreaUnit = persistedUnit;
       _selectedAreaUnit = persistedUnit;
 
-      // Load project basic info
-      final project = await _supabase
-          .from('projects')
-          .select()
-          .eq('id', widget.projectId!)
-          .single();
+      final projectBundle =
+          await ProjectStorageService.fetchProjectDataById(widget.projectId!);
+      if (projectBundle == null) {
+        throw Exception('Project data not found for ${widget.projectId}');
+      }
+
+      double parseSnapshotNumber(dynamic value) {
+        if (value == null) return 0.0;
+        if (value is num) return value.toDouble();
+        return double.tryParse(value
+                .toString()
+                .replaceAll(',', '')
+                .replaceAll('₹', '')
+                .trim()) ??
+            0.0;
+      }
+
+      // Build project fields from decrypted payload.
+      final project = <String, dynamic>{
+        'project_name': (projectBundle['projectName'] ?? '').toString(),
+        'project_address': (projectBundle['projectAddress'] ?? '').toString(),
+        'google_maps_link': (projectBundle['googleMapsLink'] ?? '').toString(),
+        'total_area': parseSnapshotNumber(projectBundle['totalArea']),
+        'selling_area': parseSnapshotNumber(projectBundle['sellingArea']),
+        'estimated_development_cost':
+            parseSnapshotNumber(projectBundle['estimatedDevelopmentCost']),
+      };
 
       setState(() {
         _projectNameController.text =
@@ -2003,11 +2024,12 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                 : _formatInputAmount(estimatedCost);
       });
 
-      // Load non-sellable areas
-      final nonSellableAreas = await _supabase
-          .from('non_sellable_areas')
-          .select()
-          .eq('project_id', widget.projectId!);
+      // Load non-sellable areas from decrypted payload
+      final nonSellableAreas =
+          ((projectBundle['nonSellableAreas'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((e) => e.cast<String, dynamic>())
+              .toList();
 
       // Dispose old controllers first
       for (var controller in _nonSellableNameControllers.values) {
@@ -2068,13 +2090,11 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         _isAreaDataLoading = false;
       });
 
-      // Load partners
-      final partners = await _supabase
-          .from('partners')
-          .select()
-          .eq('project_id', widget.projectId!)
-          .order('created_at', ascending: true)
-          .order('id', ascending: true);
+      // Load partners from decrypted payload
+      final partners = ((projectBundle['partners'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
 
       // Dispose old controllers first
       for (var controller in _partnerNameControllers.values) {
@@ -2123,13 +2143,11 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         _partnersDirty = false;
       });
 
-      // Load expenses
-      final expenses = await _supabase
-          .from('expenses')
-          .select()
-          .eq('project_id', widget.projectId!)
-          .order('created_at', ascending: true)
-          .order('id', ascending: true);
+      // Load expenses from decrypted payload
+      final expenses = ((projectBundle['expenses'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
 
       // Dispose old controllers first
       for (var controller in _expenseItemControllers.values) {
@@ -2217,38 +2235,51 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       });
 
       // Load layouts and plots
-      // Ensure deterministic ordering based on user entry:
-      // - Layouts ordered by created_at
-      // - Plots within each layout ordered by created_at
-      final layouts = await _supabase
-          .from('layouts')
-          .select()
-          .eq('project_id', widget.projectId!)
-          .order('created_at', ascending: true)
-          .order('id', ascending: true);
+      final layouts = ((projectBundle['layouts'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
+      final allPlots = ((projectBundle['plots'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
+      final allPlotPartners =
+          ((projectBundle['plot_partners'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((e) => e.cast<String, dynamic>())
+              .toList();
+
+      final plotsByLayoutId = <String, List<Map<String, dynamic>>>{};
+      for (final plot in allPlots) {
+        final layoutId = (plot['layout_id'] ?? '').toString();
+        if (layoutId.isEmpty) continue;
+        plotsByLayoutId.putIfAbsent(layoutId, () => <Map<String, dynamic>>[]);
+        plotsByLayoutId[layoutId]!.add(plot);
+      }
+      final partnersByPlotId = <String, List<String>>{};
+      for (final row in allPlotPartners) {
+        final plotId = (row['plot_id'] ?? '').toString();
+        final partnerName = (row['partner_name'] ?? '').toString();
+        if (plotId.isEmpty || partnerName.trim().isEmpty) continue;
+        partnersByPlotId.putIfAbsent(plotId, () => <String>[]);
+        partnersByPlotId[plotId]!.add(partnerName);
+      }
 
       final layoutsData = <Map<String, dynamic>>[];
 
       if (layouts.isNotEmpty) {
         for (var layout in layouts) {
-          final layoutId = layout['id'];
-          final plots = await _supabase
-              .from('plots')
-              .select()
-              .eq('layout_id', layoutId)
-              .order('created_at', ascending: true)
-              .order('id', ascending: true);
+          final layoutId = (layout['id'] ?? '').toString();
+          final plots =
+              plotsByLayoutId[layoutId] ?? const <Map<String, dynamic>>[];
 
           final plotsData = <Map<String, dynamic>>[];
           for (var plot in plots) {
-            // Load plot partners
-            final plotPartners = await _supabase
-                .from('plot_partners')
-                .select()
-                .eq('plot_id', plot['id']);
+            final plotId = (plot['id'] ?? '').toString();
+            final plotPartners = partnersByPlotId[plotId] ?? const <String>[];
 
             plotsData.add({
-              'id': (plot['id'] ?? '').toString(),
+              'id': plotId,
               'plotNumber': (plot['plot_number'] ?? '').toString(),
               'area': _formatAreaDecimal(plot['area'] ?? 0.0),
               'purchaseRate':
@@ -2262,9 +2293,7 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
               'buyerName': (plot['buyer_name'] ?? '').toString(),
               'saleDate': _formatDateFromDatabase(plot['sale_date']),
               'agent': (plot['agent_name'] ?? '').toString(),
-              'partners': plotPartners
-                  .map((p) => (p['partner_name'] ?? '').toString())
-                  .toList(),
+              'partners': List<String>.from(plotPartners),
               'payments': plot['payments'] ?? [],
             });
           }
@@ -2392,12 +2421,12 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
         }
       });
 
-      // Load project managers - ordered by created_at to preserve entry order
-      final projectManagersRaw = await _supabase
-          .from('project_managers')
-          .select()
-          .eq('project_id', widget.projectId!)
-          .order('created_at', ascending: true);
+      // Load project managers from decrypted payload
+      final projectManagersRaw =
+          ((projectBundle['project_managers'] as List?) ?? const [])
+              .whereType<Map>()
+              .map((e) => e.cast<String, dynamic>())
+              .toList();
 
       // Deduplicate project managers by ID first, then by name to prevent showing duplicates
       // Keep the first occurrence (oldest by created_at) for each unique name
@@ -2442,18 +2471,9 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       print(
           '_loadProjectData: Deduplication complete - kept ${projectManagers.length} managers, marked ${duplicateIdsToDelete.length} for deletion');
 
-      // Clean up duplicates from database (async, don't wait)
       if (duplicateIdsToDelete.isNotEmpty) {
         print(
-            '_loadProjectData: Cleaning up ${duplicateIdsToDelete.length} duplicate project managers from database');
-        _supabase
-            .from('project_managers')
-            .delete()
-            .inFilter('id', duplicateIdsToDelete)
-            .then((_) => print(
-                '_loadProjectData: Successfully deleted ${duplicateIdsToDelete.length} duplicate managers'))
-            .catchError((e) =>
-                print('_loadProjectData: Error deleting duplicates: $e'));
+            '_loadProjectData: Skipping duplicate manager row cleanup write in encrypted-only mode');
       }
 
       print(
@@ -2581,59 +2601,15 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       // Use _projectManagers instead of projectManagers to ensure correct indexing
       final loadedManagerBlocks = <int, List<String>>{};
       for (int i = 0; i < _projectManagers.length; i++) {
-        final managerId = _projectManagers[i]['id'];
-        if (managerId == null) continue;
-
-        // Load block associations
-        final blockAssociations = await _supabase
-            .from('project_manager_blocks')
-            .select('plot_id')
-            .eq('project_manager_id', managerId);
-
-        if (blockAssociations.isNotEmpty) {
-          final plotIds = blockAssociations.map((b) => b['plot_id']).toList();
-
-          // Get plot details - query each plot individually if needed
-          final plots = <Map<String, dynamic>>[];
-          for (var plotId in plotIds) {
-            final plotResult = await _supabase
-                .from('plots')
-                .select('id, plot_number, layout_id')
-                .eq('id', plotId);
-            if (plotResult.isNotEmpty) {
-              plots.addAll(plotResult);
-            }
-          }
-
-          // Get layout details
-          final layoutIds = plots.map((p) => p['layout_id']).toSet().toList();
-          final layouts = <Map<String, dynamic>>[];
-          for (var layoutId in layoutIds) {
-            final layoutResult = await _supabase
-                .from('layouts')
-                .select('id, name')
-                .eq('id', layoutId);
-            if (layoutResult.isNotEmpty) {
-              layouts.addAll(layoutResult);
-            }
-          }
-
-          final layoutMap = <String, String>{};
-          for (var layout in layouts) {
-            layoutMap[layout['id']] = (layout['name'] ?? '').toString();
-          }
-
-          // Reconstruct block strings
-          final selectedBlocks = <String>[];
-          for (var plot in plots) {
-            final layoutId = plot['layout_id'];
-            final layoutName = layoutMap[layoutId] ?? '';
-            final plotNumber = (plot['plot_number'] ?? '').toString();
-            if (layoutName.isNotEmpty && plotNumber.isNotEmpty) {
-              selectedBlocks.add('$layoutName - $plotNumber');
-            }
-          }
-
+        final manager = _projectManagers[i];
+        final selectedBlocksRaw =
+            manager['selected_blocks'] ?? manager['selectedBlocks'] ?? const [];
+        if (selectedBlocksRaw is! List) continue;
+        final selectedBlocks = selectedBlocksRaw
+            .map((e) => e.toString().trim())
+            .where((e) => e.isNotEmpty)
+            .toList();
+        if (selectedBlocks.isNotEmpty) {
           loadedManagerBlocks[i] = selectedBlocks;
         }
       }
@@ -2653,12 +2629,11 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
             'After setState, _projectManagerSelectedBlocks keys: ${_projectManagerSelectedBlocks.keys.toList()}');
       }
 
-      // Load agents
-      final agents = await _supabase
-          .from('agents')
-          .select()
-          .eq('project_id', widget.projectId!)
-          .order('created_at', ascending: true);
+      // Load agents from decrypted payload
+      final agents = ((projectBundle['agents'] as List?) ?? const [])
+          .whereType<Map>()
+          .map((e) => e.cast<String, dynamic>())
+          .toList();
 
       print('_loadProjectData: Loaded ${agents.length} agents from database');
       for (var agent in agents) {
@@ -2799,58 +2774,14 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       final loadedAgentBlocks = <int, List<String>>{};
       for (int i = 0; i < agents.length; i++) {
         final agent = agents[i];
-        final agentId = agent['id'];
-
-        // Load block associations
-        final blockAssociations = await _supabase
-            .from('agent_blocks')
-            .select('plot_id')
-            .eq('agent_id', agentId);
-
-        if (blockAssociations.isNotEmpty) {
-          final plotIds = blockAssociations.map((b) => b['plot_id']).toList();
-
-          // Get plot details - query each plot individually if needed
-          final plots = <Map<String, dynamic>>[];
-          for (var plotId in plotIds) {
-            final plotResult = await _supabase
-                .from('plots')
-                .select('id, plot_number, layout_id')
-                .eq('id', plotId);
-            if (plotResult.isNotEmpty) {
-              plots.addAll(plotResult);
-            }
-          }
-
-          // Get layout details
-          final layoutIds = plots.map((p) => p['layout_id']).toSet().toList();
-          final layouts = <Map<String, dynamic>>[];
-          for (var layoutId in layoutIds) {
-            final layoutResult = await _supabase
-                .from('layouts')
-                .select('id, name')
-                .eq('id', layoutId);
-            if (layoutResult.isNotEmpty) {
-              layouts.addAll(layoutResult);
-            }
-          }
-
-          final layoutMap = <String, String>{};
-          for (var layout in layouts) {
-            layoutMap[layout['id']] = (layout['name'] ?? '').toString();
-          }
-
-          // Reconstruct block strings
-          final selectedBlocks = <String>[];
-          for (var plot in plots) {
-            final layoutId = plot['layout_id'];
-            final layoutName = layoutMap[layoutId] ?? '';
-            final plotNumber = (plot['plot_number'] ?? '').toString();
-            if (layoutName.isNotEmpty && plotNumber.isNotEmpty) {
-              selectedBlocks.add('$layoutName - $plotNumber');
-            }
-          }
-
+        final selectedBlocksRaw =
+            agent['selected_blocks'] ?? agent['selectedBlocks'] ?? const [];
+        if (selectedBlocksRaw is! List) continue;
+        final selectedBlocks = selectedBlocksRaw
+            .map((e) => e.toString().trim())
+            .where((e) => e.isNotEmpty)
+            .toList();
+        if (selectedBlocks.isNotEmpty) {
           loadedAgentBlocks[i] = selectedBlocks;
         }
       }
@@ -2919,6 +2850,20 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
     } catch (e, stackTrace) {
       print('Error loading project data: $e');
       print('Stack trace: $stackTrace');
+      final errorText = e.toString();
+      if (mounted &&
+          (errorText.contains('Encryption key is missing') ||
+              errorText
+                  .contains('Encrypted data exists but key is unavailable'))) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Unable to decrypt project data on this URL/port. Open the app on the same origin used when data was saved.',
+            ),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
       if (mounted) {
         setState(() {
           _isAreaDataLoading = false;
@@ -2938,7 +2883,9 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
       print('_loadProjectData: Finished loading, _isLoadingData set to false');
       _clearExpenseUndoHistory();
       _clearAllLayoutUndoHistory();
-      widget.onSaveStatusChanged?.call(ProjectSaveStatusType.saved);
+      widget.onSaveStatusChanged?.call(_hasSuccessfullyLoadedFromSupabase
+          ? ProjectSaveStatusType.saved
+          : ProjectSaveStatusType.notSaved);
       // Recalculate errors after data has been loaded
       _notifyErrorState();
 
@@ -21356,39 +21303,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                                   layout['name']?.toString().trim() ??
                                   '';
 
-                          // Delete from database if layout has a name and project ID
-                          if (layoutNameToDelete.isNotEmpty &&
-                              widget.projectId != null) {
-                            try {
-                              // Find layout by name
-                              final existingLayouts = await _supabase
-                                  .from('layouts')
-                                  .select('id')
-                                  .eq('project_id', widget.projectId!)
-                                  .eq('name', layoutNameToDelete)
-                                  .maybeSingle();
-
-                              if (existingLayouts != null &&
-                                  existingLayouts['id'] != null) {
-                                final layoutId =
-                                    existingLayouts['id'] as String;
-
-                                // Delete all plots in this layout first
-                                await _supabase
-                                    .from('plots')
-                                    .delete()
-                                    .eq('layout_id', layoutId);
-
-                                // Delete the layout
-                                await _supabase
-                                    .from('layouts')
-                                    .delete()
-                                    .eq('id', layoutId);
-                              }
-                            } catch (e) {
-                              print('Error deleting layout from database: $e');
-                            }
-                          }
+                          // In encrypted-only mode we persist by saving the
+                          // full local snapshot, so no direct row deletes here.
 
                           // Remove from local state
                           setState(() {
@@ -21817,34 +21733,8 @@ class _ProjectDetailsPageState extends State<ProjectDetailsPage> {
                             ? () async {
                                 confirmController.dispose();
                                 Navigator.of(context).pop();
-                                // Delete all layouts from database
-                                if (widget.projectId != null) {
-                                  try {
-                                    // Get all layouts for this project
-                                    final existingLayouts = await _supabase
-                                        .from('layouts')
-                                        .select('id')
-                                        .eq('project_id', widget.projectId!);
-
-                                    // Delete all plots first
-                                    for (var layout in existingLayouts) {
-                                      final layoutId = layout['id'] as String;
-                                      await _supabase
-                                          .from('plots')
-                                          .delete()
-                                          .eq('layout_id', layoutId);
-                                    }
-
-                                    // Delete all layouts
-                                    await _supabase
-                                        .from('layouts')
-                                        .delete()
-                                        .eq('project_id', widget.projectId!);
-                                  } catch (e) {
-                                    print(
-                                        'Error deleting all layouts from database: $e');
-                                  }
-                                }
+                                // In encrypted-only mode we persist by saving
+                                // full local snapshot, not direct row deletes.
 
                                 // Clear local state
                                 setState(() {

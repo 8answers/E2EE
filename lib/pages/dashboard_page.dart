@@ -6,6 +6,7 @@ import 'dart:math' as math;
 import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/area_unit_service.dart';
+import '../services/project_storage_service.dart';
 import '../utils/area_unit_utils.dart';
 import '../widgets/area_unit_selector.dart';
 import 'project_details_page.dart';
@@ -664,6 +665,241 @@ class _DashboardPageState extends State<DashboardPage> {
       }
 
       // Fetch project data
+      final projectSnapshot =
+          await ProjectStorageService.fetchProjectDataById(projectId);
+      if (projectSnapshot != null) {
+        double parseNum(dynamic value) {
+          if (value == null) return 0.0;
+          if (value is num) return value.toDouble();
+          return double.tryParse(value
+                  .toString()
+                  .replaceAll(',', '')
+                  .replaceAll('₹', '')
+                  .trim()) ??
+              0.0;
+        }
+
+        final layouts = ((projectSnapshot['layouts'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+        final plots = ((projectSnapshot['plots'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+        final plotPartners =
+            ((projectSnapshot['plot_partners'] as List?) ?? const [])
+                .whereType<Map>()
+                .map((e) => e.cast<String, dynamic>())
+                .toList();
+        final expenses = ((projectSnapshot['expenses'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+        final nonSellableAreas =
+            ((projectSnapshot['nonSellableAreas'] as List?) ?? const [])
+                .whereType<Map>()
+                .map((e) => e.cast<String, dynamic>())
+                .toList();
+        final partnersRaw = ((projectSnapshot['partners'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+        final projectManagers =
+            ((projectSnapshot['project_managers'] as List?) ?? const [])
+                .whereType<Map>()
+                .map((e) => e.cast<String, dynamic>())
+                .toList();
+        final agents = ((projectSnapshot['agents'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+
+        final dashboardPlots =
+            plots.where(_shouldIncludePlotInDashboard).toList();
+        final estimatedDevelopmentCost =
+            parseNum(projectSnapshot['estimatedDevelopmentCost']);
+        final totalExpenses = expenses.fold<double>(
+          0.0,
+          (sum, row) => sum + parseNum(row['amount']),
+        );
+        final totalArea = parseNum(projectSnapshot['totalArea']);
+        final sellingArea = parseNum(projectSnapshot['sellingArea']);
+        final nonSellableArea = nonSellableAreas.fold<double>(
+          0.0,
+          (sum, row) => sum + parseNum(row['area']),
+        );
+        final allInCost = sellingArea > 0 ? totalExpenses / sellingArea : 0.0;
+        final totalLayouts = layouts.length;
+        final totalPlots = dashboardPlots.length;
+        final availablePlots =
+            dashboardPlots.where((p) => p['status'] == 'available').length;
+        final soldPlots =
+            dashboardPlots.where((p) => p['status'] == 'sold').length;
+        final pendingPlots = dashboardPlots.where((p) {
+          final status = (p['status'] ?? '').toString().toLowerCase();
+          return status == 'reserved' || status == 'pending';
+        }).length;
+        final saleProgress =
+            totalPlots > 0 ? (soldPlots / totalPlots) * 100 : 0.0;
+        final totalSalesValue = dashboardPlots
+            .where((p) => p['status'] == 'sold')
+            .fold<double>(
+              0.0,
+              (sum, plot) =>
+                  sum + (parseNum(plot['sale_price']) * parseNum(plot['area'])),
+            );
+        final totalSalePriceSum =
+            dashboardPlots.where((p) => p['status'] == 'sold').fold<double>(
+                  0.0,
+                  (sum, plot) => sum + parseNum(plot['sale_price']),
+                );
+        final avgSalePricePerSqft =
+            soldPlots > 0 ? totalSalePriceSum / soldPlots : 0.0;
+
+        final layoutById = <String, Map<String, dynamic>>{};
+        for (final layout in layouts) {
+          final id = (layout['id'] ?? '').toString();
+          if (id.isNotEmpty) layoutById[id] = layout;
+        }
+        final plotNumberById = <String, String>{};
+        for (final plot in plots) {
+          final id = (plot['id'] ?? '').toString();
+          if (id.isEmpty) continue;
+          plotNumberById[id] = (plot['plot_number'] ?? '').toString();
+        }
+        final plotAssignmentsByPartner = <String, List<String>>{};
+        for (final row in plotPartners) {
+          final partnerName = _normalizePartnerName(row['partner_name']);
+          final plotId = (row['plot_id'] ?? '').toString();
+          final plotNumber = plotNumberById[plotId] ?? '';
+          if (partnerName.isEmpty || plotNumber.isEmpty) continue;
+          plotAssignmentsByPartner.putIfAbsent(partnerName, () => <String>[]);
+          plotAssignmentsByPartner[partnerName]!.add(plotNumber);
+        }
+
+        final salesByLayout = <Map<String, dynamic>>[];
+        final siteLayouts = <Map<String, dynamic>>[];
+        for (final layout in layouts) {
+          final layoutId = (layout['id'] ?? '').toString();
+          final layoutName = (layout['name'] ?? '').toString();
+          final layoutPlots = dashboardPlots
+              .where((p) => (p['layout_id'] ?? '').toString() == layoutId)
+              .toList();
+          final layoutSoldPlots =
+              layoutPlots.where((p) => p['status'] == 'sold').toList();
+          final layoutSalesValue = layoutSoldPlots.fold<double>(
+            0.0,
+            (sum, plot) =>
+                sum + (parseNum(plot['sale_price']) * parseNum(plot['area'])),
+          );
+          final layoutSalePercentage = layoutPlots.isNotEmpty
+              ? (layoutSoldPlots.length / layoutPlots.length) * 100
+              : 0.0;
+
+          salesByLayout.add({
+            'name': layoutName,
+            'totalPlots': layoutPlots.length,
+            'soldPlots': layoutSoldPlots.length,
+            'salesValue': layoutSalesValue,
+            'salePercentage': layoutSalePercentage,
+          });
+
+          final plotsWithPartners = layoutPlots.map((plot) {
+            final plotId = (plot['id'] ?? '').toString();
+            final partnerNames = plotPartners
+                .where((row) => (row['plot_id'] ?? '').toString() == plotId)
+                .map((row) => (row['partner_name'] ?? '').toString())
+                .where((name) => name.trim().isNotEmpty)
+                .toList();
+            return <String, dynamic>{
+              ...plot,
+              'partners': partnerNames,
+            };
+          }).toList();
+          siteLayouts.add({
+            'id': layoutId,
+            'name': layoutName,
+            'plots': plotsWithPartners,
+          });
+        }
+
+        if (!_isDashboardLoadCurrent(loadGeneration)) return;
+        setState(() {
+          _dashboardData = {
+            'estimatedDevelopmentCost': estimatedDevelopmentCost,
+            'totalExpenses': totalExpenses,
+            'expenses': expenses,
+            'allInCost': allInCost,
+            'totalArea': totalArea,
+            'sellingArea': sellingArea,
+            'nonSellableArea': nonSellableArea,
+            'totalLayouts': totalLayouts,
+            'totalPlots': totalPlots,
+            'availablePlots': availablePlots,
+            'soldPlots': soldPlots,
+            'pendingPlots': pendingPlots,
+            'saleProgress': saleProgress,
+            'totalSalesValue': totalSalesValue,
+            'avgSalePricePerSqft': avgSalePricePerSqft,
+            'salesByLayout': salesByLayout,
+          };
+          _siteLayouts = siteLayouts;
+          _partners = partnersRaw.asMap().entries.map((entry) {
+            final index = entry.key;
+            final row = entry.value;
+            final rawName = (row['name'] ?? '').toString();
+            final assignedPlots =
+                plotAssignmentsByPartner[_normalizePartnerName(rawName)] ?? [];
+            final displayName = rawName.trim().isEmpty
+                ? 'Unnamed Partner ${index + 1}'
+                : rawName;
+            return <String, dynamic>{
+              'name': displayName,
+              'amount': parseNum(row['amount']),
+              'assignedPlots': assignedPlots,
+              'plotCount': assignedPlots.length,
+            };
+          }).toList();
+          _projectManagers = projectManagers;
+          _agents = agents;
+          _isPartnersLoading = false;
+          _isProjectManagersLoading = false;
+          _isAgentsLoading = false;
+          _isSiteDataLoading = false;
+        });
+
+        await _applyUnsyncedLocalDraftsIfAny(loadGeneration: loadGeneration);
+        if (!_isDashboardLoadCurrent(loadGeneration)) return;
+
+        final grossProfit = _calculateTotalGrossProfit();
+        final totalPMCompensation =
+            _calculateTotalProjectManagersCompensation();
+        final totalAgentCompensation = _calculateTotalAgentsCompensation();
+        final totalCompensation = totalPMCompensation + totalAgentCompensation;
+        final netProfit = grossProfit - totalCompensation;
+        final profitMargin =
+            totalSalesValue > 0 ? (netProfit / totalSalesValue) * 100 : 0.0;
+        final roi = totalExpenses > 0 ? (netProfit / totalExpenses) * 100 : 0.0;
+        if (!_isDashboardLoadCurrent(loadGeneration)) return;
+        setState(() {
+          _dashboardData = {
+            ..._dashboardData!,
+            'grossProfit': grossProfit,
+            'netProfit': netProfit,
+            'profitMargin': profitMargin,
+            'roi': roi,
+            'totalProjectManagerCompensation': totalPMCompensation,
+            'totalAgentCompensation': totalAgentCompensation,
+            'totalCompensation': totalCompensation,
+          };
+          _isLoading = false;
+        });
+        _notifyLoadingState(false);
+        return;
+      }
+
+      // Fetch project data
       final projectData = await _supabase
           .from('projects')
           .select()
@@ -1219,6 +1455,40 @@ class _DashboardPageState extends State<DashboardPage> {
     final projectId = widget.projectId!;
 
     try {
+      final projectSnapshot =
+          await ProjectStorageService.fetchProjectDataById(projectId);
+      if (projectSnapshot != null) {
+        final snapshotManagers =
+            ((projectSnapshot['project_managers'] as List?) ?? const [])
+                .whereType<Map>()
+                .map((pm) {
+          final row = pm.cast<String, dynamic>();
+          return <String, dynamic>{
+            'id': (row['id'] ?? '').toString(),
+            'name': (row['name'] ?? '').toString(),
+            'compensation_type':
+                (row['compensation_type'] ?? row['compensation'] ?? '')
+                    .toString(),
+            'earning_type': (row['earning_type'] ?? '').toString(),
+            'percentage': _toDouble(row['percentage']),
+            'fixed_fee': _toDouble(row['fixed_fee']),
+            'monthly_fee': _toDouble(row['monthly_fee']),
+            'months': _toDouble(row['months']).toInt(),
+          };
+        }).toList();
+
+        if (loadGeneration != null &&
+            !_isDashboardLoadCurrent(loadGeneration)) {
+          return;
+        }
+        setState(() {
+          _projectManagers = snapshotManagers;
+          _isProjectManagersLoading = false;
+        });
+        await _applyUnsyncedLocalDraftsIfAny(loadGeneration: loadGeneration);
+        return;
+      }
+
       final projectManagers = await _supabase
           .from('project_managers')
           .select('*')
@@ -1264,6 +1534,45 @@ class _DashboardPageState extends State<DashboardPage> {
     final projectId = widget.projectId!;
 
     try {
+      final projectSnapshot =
+          await ProjectStorageService.fetchProjectDataById(projectId);
+      if (projectSnapshot != null) {
+        final snapshotAgents =
+            ((projectSnapshot['agents'] as List?) ?? const [])
+                .whereType<Map>()
+                .map((agent) {
+          final row = agent.cast<String, dynamic>();
+          final perSqftFee = _toDouble(row['per_sqft_fee']);
+          return <String, dynamic>{
+            'id': (row['id'] ?? '').toString(),
+            'name': (row['name'] ?? '').toString(),
+            'compensation_type':
+                (row['compensation_type'] ?? row['compensation'] ?? '')
+                    .toString(),
+            'earning_type': (row['earning_type'] ?? '').toString(),
+            'percentage': _toDouble(row['percentage']),
+            'fixed_fee': _toDouble(row['fixed_fee']),
+            'monthly_fee': _toDouble(row['monthly_fee']),
+            'months': _toDouble(row['months']).toInt(),
+            'per_sqft_fee': perSqftFee,
+            'per_sqm_fee': row['per_sqm_fee'] == null
+                ? AreaUnitUtils.rateFromSqftToDisplay(perSqftFee, true)
+                : _toDouble(row['per_sqm_fee']),
+          };
+        }).toList();
+
+        if (loadGeneration != null &&
+            !_isDashboardLoadCurrent(loadGeneration)) {
+          return;
+        }
+        setState(() {
+          _agents = snapshotAgents;
+          _isAgentsLoading = false;
+        });
+        await _applyUnsyncedLocalDraftsIfAny(loadGeneration: loadGeneration);
+        return;
+      }
+
       final agents = await _supabase
           .from('agents')
           .select('*')
@@ -1313,6 +1622,116 @@ class _DashboardPageState extends State<DashboardPage> {
     try {
       final userId = _supabase.auth.currentUser?.id;
       if (userId == null) return;
+
+      final projectSnapshot =
+          await ProjectStorageService.fetchProjectDataById(projectId);
+      if (projectSnapshot != null) {
+        final layouts = ((projectSnapshot['layouts'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+        final plots = ((projectSnapshot['plots'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e.cast<String, dynamic>())
+            .toList();
+
+        final compensationLayouts = <Map<String, dynamic>>[];
+        double totalCompensation = 0.0;
+        final allInCost = _dashboardData!['allInCost'] as double? ?? 0.0;
+
+        for (final layout in layouts) {
+          final layoutId = (layout['id'] ?? '').toString();
+          final layoutPlots = plots
+              .where((plot) => (plot['layout_id'] ?? '').toString() == layoutId)
+              .where(_shouldIncludePlotInDashboard)
+              .toList();
+
+          final plotsWithCompensation = <Map<String, dynamic>>[];
+          for (final plot in layoutPlots) {
+            final status =
+                (plot['status'] ?? 'available').toString().toLowerCase();
+            final agentName =
+                (plot['agent_name'] ?? plot['agent'] ?? '').toString().trim();
+            double plotCompensation = 0.0;
+            if (status == 'sold' &&
+                agentName.isNotEmpty &&
+                _agents.isNotEmpty) {
+              final matchedAgent = _agents.firstWhere(
+                (agent) =>
+                    (agent['name'] ?? '').toString().trim().toLowerCase() ==
+                    agentName.toLowerCase(),
+                orElse: () => <String, dynamic>{},
+              );
+              if (matchedAgent.isNotEmpty) {
+                plotCompensation =
+                    _calculateAgentPerPlotCompensation(matchedAgent, plot);
+              }
+              totalCompensation += plotCompensation;
+            }
+
+            plotsWithCompensation.add({
+              ...plot,
+              'agent_name': agentName,
+              'compensation': plotCompensation,
+            });
+          }
+
+          double totalArea = 0.0;
+          double totalPlotCost = 0.0;
+          double totalSaleValue = 0.0;
+          int availablePlots = 0;
+          int soldPlots = 0;
+
+          for (final plot in plotsWithCompensation) {
+            final area = _toDouble(plot['area']);
+            final status =
+                (plot['status'] ?? 'available').toString().toLowerCase();
+            final salePrice = _toDouble(plot['sale_price']);
+            totalArea += area;
+            totalPlotCost += area * allInCost;
+            if (status == 'sold') {
+              soldPlots++;
+              totalSaleValue += salePrice * area;
+            } else {
+              availablePlots++;
+            }
+          }
+
+          final grossProfit = totalSaleValue - totalPlotCost;
+          final layoutCompensation = plotsWithCompensation.fold<double>(
+            0.0,
+            (sum, plot) {
+              final status =
+                  (plot['status'] ?? 'available').toString().toLowerCase();
+              if (status == 'sold') {
+                return sum + _toDouble(plot['compensation']);
+              }
+              return sum;
+            },
+          );
+
+          compensationLayouts.add({
+            'id': layoutId,
+            'name': (layout['name'] ?? '').toString(),
+            'plots': plotsWithCompensation,
+            'totalPlots': plotsWithCompensation.length,
+            'availablePlots': availablePlots,
+            'soldPlots': soldPlots,
+            'grossProfit': grossProfit,
+            'totalCompensation': layoutCompensation,
+          });
+        }
+
+        if (loadGeneration != null &&
+            !_isDashboardLoadCurrent(loadGeneration)) {
+          return;
+        }
+        setState(() {
+          _compensationLayouts = compensationLayouts;
+          _totalCompensation = totalCompensation;
+        });
+        return;
+      }
 
       // Fetch layouts
       final layouts = await _supabase

@@ -38,6 +38,53 @@ class _CreateProjectDialogState extends State<CreateProjectDialog> {
     super.dispose();
   }
 
+  String _normalizedProjectName(String value) {
+    return value.trim().replaceAll(RegExp(r'\s+'), ' ');
+  }
+
+  String _projectNameKey(String value) {
+    return _normalizedProjectName(value).toLowerCase();
+  }
+
+  Future<String> _resolveUniqueProjectName(
+    String userId,
+    String desiredName,
+  ) async {
+    final baseName = _normalizedProjectName(desiredName);
+    if (baseName.isEmpty) return baseName;
+
+    final existing = await _supabase
+        .from('projects')
+        .select('project_name')
+        .eq('user_id', userId);
+
+    final existingKeys = <String>{};
+    for (final row in existing) {
+      final name = (row['project_name'] ?? '').toString();
+      if (name.trim().isEmpty) continue;
+      existingKeys.add(_projectNameKey(name));
+    }
+
+    if (!existingKeys.contains(_projectNameKey(baseName))) {
+      return baseName;
+    }
+
+    var suffix = 2;
+    while (true) {
+      final candidate = '$baseName ($suffix)';
+      if (!existingKeys.contains(_projectNameKey(candidate))) {
+        return candidate;
+      }
+      suffix++;
+    }
+  }
+
+  bool _isDuplicateProjectNameError(Object error) {
+    final message = error.toString();
+    return message.contains('projects_user_id_project_name_key') ||
+        message.contains('code: 23505');
+  }
+
   @override
   Widget build(BuildContext context) {
     return Dialog(
@@ -330,7 +377,7 @@ class _CreateProjectDialogState extends State<CreateProjectDialog> {
   }
 
   Future<void> _createProject() async {
-    final projectName = _projectNameController.text.trim();
+    final projectName = _normalizedProjectName(_projectNameController.text);
     if (projectName.isEmpty) return;
 
     setState(() {
@@ -351,20 +398,33 @@ class _CreateProjectDialogState extends State<CreateProjectDialog> {
         return;
       }
 
-      final response = await _supabase
-          .from('projects')
-          .insert({
-            'user_id': userId,
-            'project_name': projectName,
-            'project_status': 'Active',
-            'project_address': '',
-            'google_maps_link': '',
-            'total_area': 0.00,
-            'selling_area': 0.00,
-            'estimated_development_cost': 0.00,
-          })
-          .select()
-          .single();
+      var finalProjectName =
+          await _resolveUniqueProjectName(userId, projectName);
+      Map<String, dynamic> response;
+
+      while (true) {
+        try {
+          response = await _supabase
+              .from('projects')
+              .insert({
+                'user_id': userId,
+                'project_name': finalProjectName,
+                'project_status': 'Active',
+                'project_address': '',
+                'google_maps_link': '',
+                'total_area': 0.00,
+                'selling_area': 0.00,
+                'estimated_development_cost': 0.00,
+              })
+              .select()
+              .single();
+          break;
+        } catch (e) {
+          if (!_isDuplicateProjectNameError(e)) rethrow;
+          finalProjectName =
+              await _resolveUniqueProjectName(userId, projectName);
+        }
+      }
 
       final createdProjectId = (response['id'] ?? '').toString();
       if (createdProjectId.isNotEmpty) {
@@ -374,7 +434,7 @@ class _CreateProjectDialogState extends State<CreateProjectDialog> {
       if (mounted) {
         Navigator.of(context).pop({
           'projectId': response['id'],
-          'projectName': projectName,
+          'projectName': finalProjectName,
           'baseAreaUnit': _selectedAreaUnit,
         });
       }
@@ -387,6 +447,9 @@ class _CreateProjectDialogState extends State<CreateProjectDialog> {
             backgroundColor: Colors.red,
           ),
         );
+      }
+    } finally {
+      if (mounted) {
         setState(() {
           _isCreating = false;
         });
